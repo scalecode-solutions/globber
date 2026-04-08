@@ -115,7 +115,7 @@ pub use matcher::MatchOptions;
 pub use entry::{Entry, FileKind};
 pub use walker::{WalkOptions, WalkResult, walk};
 pub use ruleset::Ruleset;
-pub use sif_output::{to_sif, to_sif_with_summary, to_sif_with_summary_and_budget, to_paths, write_preview, BudgetInfo};
+pub use sif_output::{to_sif, to_sif_with_summary, to_sif_with_summary_and_budget, to_paths, write_preview, BudgetInfo, PreviewMode};
 
 // ── Convenience functions ────────────────────────────────────────────
 
