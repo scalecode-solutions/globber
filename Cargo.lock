@@ -93,7 +93,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "globber"
+name = "globber-ai"
 version = "0.6.9"
 dependencies = [
  "rayon",
