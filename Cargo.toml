@@ -1,14 +1,16 @@
 [package]
 name = "globber"
-version = "0.4.0"
-edition = "2021"
-rust-version = "1.70"
+version = "0.6.9"
+edition = "2024"
+rust-version = "1.85"
 description = "AI-native glob — POSIX-rooted pattern matching with SIF output, budget-aware walking, multi-pattern rulesets, and linear-time matching"
 license = "MIT OR Apache-2.0"
 keywords = ["glob", "pattern", "sif", "ai", "filesystem"]
 categories = ["filesystem", "parser-implementations"]
 repository = "https://github.com/scalecode-solutions/globber"
 authors = ["Travis Jon Marquis <travis@scalecode.dev>"]
+readme = "README.md"
+exclude = ["target/"]
 
 [lib]
 name = "globber"

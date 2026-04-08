@@ -124,8 +124,45 @@ pub fn to_sif_with_summary_and_budget(entries: &[Entry], budget: &BudgetInfo) ->
     buf
 }
 
-/// Append a §preview section with the first N lines of each non-binary file.
-pub fn write_preview(entries: &[Entry], lines: usize, w: &mut dyn Write) -> std::fmt::Result {
+/// Preview mode — controls which lines are included in §preview blocks.
+#[derive(Debug, Clone)]
+pub enum PreviewMode {
+    /// First N lines (literal). `-P 10`
+    Head(usize),
+    /// Line range (1-indexed, inclusive). `-P 15-30`
+    Range(usize, usize),
+    /// N lines of code, skipping leading comments and blanks. `-P code:10`
+    Code(usize),
+}
+
+impl PreviewMode {
+    /// Parse a preview spec string.
+    ///
+    /// Formats: `10`, `15-30`, `code:10`
+    pub fn parse(s: &str) -> Result<Self, String> {
+        if let Some(rest) = s.strip_prefix("code:") {
+            let n: usize = rest.parse().map_err(|_| format!("invalid number: {}", rest))?;
+            Ok(PreviewMode::Code(n))
+        } else if let Some((a, b)) = s.split_once('-') {
+            let start: usize = a.parse().map_err(|_| format!("invalid range start: {}", a))?;
+            let end: usize = b.parse().map_err(|_| format!("invalid range end: {}", b))?;
+            if start == 0 || end == 0 || end < start {
+                return Err(format!("invalid range: {}-{} (1-indexed, end >= start)", start, end));
+            }
+            Ok(PreviewMode::Range(start, end))
+        } else {
+            let n: usize = s.parse().map_err(|_| format!("invalid preview spec: {}", s))?;
+            Ok(PreviewMode::Head(n))
+        }
+    }
+}
+
+/// Append a §preview section with lines of each non-binary file.
+pub fn write_preview(
+    entries: &[Entry],
+    mode: &PreviewMode,
+    w: &mut dyn Write,
+) -> std::fmt::Result {
     use crate::entry::FileKind;
     use std::io::BufRead;
 
@@ -133,11 +170,7 @@ pub fn write_preview(entries: &[Entry], lines: usize, w: &mut dyn Write) -> std:
     writeln!(w, "§preview")?;
 
     for entry in entries {
-        if entry.is_dir {
-            continue;
-        }
-        // Skip binary files — they won't produce useful text previews.
-        if entry.kind == FileKind::Binary {
+        if entry.is_dir || entry.kind == FileKind::Binary {
             continue;
         }
 
@@ -146,21 +179,69 @@ pub fn write_preview(entries: &[Entry], lines: usize, w: &mut dyn Write) -> std:
             Err(_) => continue,
         };
         let reader = std::io::BufReader::new(file);
-        let mut preview_lines: Vec<String> = Vec::with_capacity(lines);
-        for line in reader.lines().take(lines) {
-            match line {
-                Ok(l) => preview_lines.push(l),
-                Err(_) => break, // Binary content or encoding error — stop.
+
+        let (preview_lines, line_start) = match mode {
+            PreviewMode::Head(n) => {
+                let lines: Vec<String> = reader
+                    .lines()
+                    .take(*n)
+                    .filter_map(|l| l.ok())
+                    .collect();
+                (lines, 1usize)
             }
-        }
+            PreviewMode::Range(start, end) => {
+                let lines: Vec<String> = reader
+                    .lines()
+                    .enumerate()
+                    .skip(start - 1)
+                    .take(end - start + 1)
+                    .filter_map(|(_, l)| l.ok())
+                    .collect();
+                (lines, *start)
+            }
+            PreviewMode::Code(n) => {
+                // Skip leading comment lines (// or #! or blank) then take N lines.
+                let all_lines: Vec<String> = reader
+                    .lines()
+                    .filter_map(|l| l.ok())
+                    .collect();
+
+                let skip = all_lines
+                    .iter()
+                    .position(|l| {
+                        let trimmed = l.trim();
+                        !trimmed.is_empty()
+                            && !trimmed.starts_with("//")
+                            && !trimmed.starts_with('#')
+                            && !trimmed.starts_with("/*")
+                            && !trimmed.starts_with('*')
+                            && !trimmed.starts_with("--")
+                            && !trimmed.starts_with("'''")
+                            && !trimmed.starts_with("\"\"\"")
+                    })
+                    .unwrap_or(0);
+
+                let lines: Vec<String> = all_lines
+                    .into_iter()
+                    .skip(skip)
+                    .take(*n)
+                    .collect();
+                (lines, skip + 1)
+            }
+        };
 
         if preview_lines.is_empty() {
             continue;
         }
 
-        let path_display = entry.path.display();
-        let actual_lines = preview_lines.len();
-        writeln!(w, "#block code path={} lines=1-{}", path_display, actual_lines)?;
+        let line_end = line_start + preview_lines.len() - 1;
+        writeln!(
+            w,
+            "#block code path={} lines={}-{}",
+            entry.path.display(),
+            line_start,
+            line_end,
+        )?;
         for line in &preview_lines {
             writeln!(w, "{}", line)?;
         }
