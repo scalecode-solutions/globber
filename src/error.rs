@@ -10,6 +10,7 @@ pub struct PatternError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PatternErrorKind {
     /// More than two consecutive `*` characters.
     InvalidWildcard,
@@ -19,10 +20,9 @@ pub enum PatternErrorKind {
     UnclosedBracket,
     /// Empty bracket expression `[]` or `[!]`.
     EmptyBracket,
-    /// Unclosed brace expression `{`.
-    UnclosedBrace,
-    /// Empty brace alternative (e.g. `{,}`).
-    EmptyBraceAlternative,
+    /// Brace expansion would produce more than
+    /// [`MAX_BRACE_EXPANSIONS`](crate::pattern::MAX_BRACE_EXPANSIONS) patterns.
+    TooManyExpansions,
 }
 
 impl fmt::Display for PatternError {
@@ -34,8 +34,7 @@ impl fmt::Display for PatternError {
             }
             PatternErrorKind::UnclosedBracket => "unclosed `[` bracket expression",
             PatternErrorKind::EmptyBracket => "empty bracket expression",
-            PatternErrorKind::UnclosedBrace => "unclosed `{` brace expression",
-            PatternErrorKind::EmptyBraceAlternative => "empty brace alternative",
+            PatternErrorKind::TooManyExpansions => "brace expansion produces too many patterns",
         };
         write!(f, "pattern error at byte {}: {}", self.pos, msg)
     }

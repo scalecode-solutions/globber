@@ -12,11 +12,11 @@
 //! | Output format | Rust iterator | Rust types or SIF document |
 //! | Pattern count | Single | Single or `Ruleset` (multi-pattern) |
 //! | Negation | None | `Ruleset::exclude()` / `!` in gitignore |
-//! | Brace expansion | None | `{a,b,c}` |
+//! | Brace expansion | None | `{a,b,c}`, one walk for all alternatives |
 //! | Budget control | None | Byte budget, token budget, result limit |
 //! | File classification | None | `FileKind` (source, test, config, generated, ...) |
 //! | Backslash escape | None | `\*` escapes metacharacters (POSIX) |
-//! | Dependencies | 0 | 0 |
+//! | Parallelism | None | rayon |
 //!
 //! # Quick start
 //!
@@ -67,8 +67,8 @@
 //! use globber::{glob_with, WalkOptions};
 //!
 //! let opts = WalkOptions {
-//!     token_budget: 80_000,   // Stop when ~80K tokens matched
-//!     limit: 100,             // Or after 100 files
+//!     token_budget: Some(80_000), // Stop when ~80K tokens matched
+//!     limit: Some(100),           // Or after 100 files
 //!     ..WalkOptions::default()
 //! };
 //! let results = glob_with("src/**/*.rs", opts).unwrap();
@@ -106,14 +106,15 @@ pub mod walker;
 pub mod ruleset;
 pub mod sif_output;
 pub mod git;
+mod ignore;
 
 // ── Re-exports ───────────────────────────────────────────────────────
 
 pub use error::{GlobError, PatternError, PatternErrorKind};
-pub use pattern::{Pattern, expand_braces};
+pub use pattern::{Pattern, expand_braces, try_expand_braces, MAX_BRACE_EXPANSIONS};
 pub use matcher::MatchOptions;
 pub use entry::{Entry, FileKind};
-pub use walker::{WalkOptions, WalkResult, walk};
+pub use walker::{BudgetMode, EntryFilter, WalkOptions, WalkResult, walk, walk_many};
 pub use ruleset::Ruleset;
 pub use sif_output::{to_sif, to_sif_with_summary, to_sif_with_summary_and_budget, to_paths, write_preview, BudgetInfo, PreviewMode};
 

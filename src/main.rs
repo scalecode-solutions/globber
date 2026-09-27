@@ -9,8 +9,8 @@ use std::env;
 use std::process;
 
 use globber::{
-    expand_braces, glob_with, to_paths, to_sif, Entry, FileKind,
-    MatchOptions, Ruleset, WalkOptions,
+    expand_braces, to_paths, to_sif, Entry, EntryFilter, FileKind, MatchOptions,
+    WalkOptions,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -35,16 +35,17 @@ struct GlobArgs {
     root: Option<String>,
     format: OutputFormat,
     sorted: bool,
-    limit: usize,
-    byte_budget: u64,
-    token_budget: u64,
+    limit: Option<usize>,
+    byte_budget: Option<u64>,
+    token_budget: Option<u64>,
     hidden: bool,
     only_dirs: bool,
     summary: bool,
     kind_filter: Vec<FileKind>,
-    max_depth: usize,
+    max_depth: Option<usize>,
     no_stat: bool,
     gitignore: bool,
+    follow: bool,
     preview: Option<globber::PreviewMode>,
     git_changed: Option<String>,
 }
@@ -98,16 +99,17 @@ fn parse_glob_args(
         root: None,
         format: OutputFormat::Sif,
         sorted: true,
-        limit: 0,
-        byte_budget: 0,
-        token_budget: 0,
+        limit: None,
+        byte_budget: None,
+        token_budget: None,
         hidden: false,
         only_dirs: false,
         summary: false,
         kind_filter: Vec::new(),
-        max_depth: 0,
+        max_depth: None,
         no_stat: false,
         gitignore: false,
+        follow: false,
         preview: None,
         git_changed: None,
     };
@@ -123,6 +125,7 @@ fn parse_glob_args(
             "--no-stat" => ga.no_stat = true,
             "--gitignore" | "-g" => ga.gitignore = true,
             "--hidden" | "-a" => ga.hidden = true,
+            "--follow" | "-L" => ga.follow = true,
             "--dirs" | "-d" => ga.only_dirs = true,
             "--preview" | "-P" => {
                 let val = args.next().ok_or("--preview requires a spec (N, N-M, or code:N)")?;
@@ -142,7 +145,7 @@ fn parse_glob_args(
             }
             "--depth" => {
                 let val = args.next().ok_or("--depth requires a number")?;
-                ga.max_depth = val.parse().map_err(|_| "--depth must be a number")?;
+                ga.max_depth = Some(val.parse().map_err(|_| "--depth must be a number")?).filter(|&d| d > 0);
             }
             "--exclude" | "-e" => {
                 let val = args.next().ok_or("--exclude requires a pattern")?;
@@ -150,15 +153,15 @@ fn parse_glob_args(
             }
             "--limit" | "-n" => {
                 let val = args.next().ok_or("--limit requires a number")?;
-                ga.limit = val.parse().map_err(|_| "--limit must be a number")?;
+                ga.limit = Some(val.parse().map_err(|_| "--limit must be a number")?).filter(|&n| n > 0);
             }
             "--byte-budget" => {
                 let val = args.next().ok_or("--byte-budget requires a number")?;
-                ga.byte_budget = parse_size(&val)?;
+                ga.byte_budget = Some(parse_size(&val)?).filter(|&n| n > 0);
             }
             "--token-budget" | "-t" => {
                 let val = args.next().ok_or("--token-budget requires a number")?;
-                ga.token_budget = parse_size(&val)?;
+                ga.token_budget = Some(parse_size(&val)?).filter(|&n| n > 0);
             }
             "--kind" | "-k" => {
                 let val = args.next().ok_or("--kind requires a value")?;
@@ -250,31 +253,61 @@ fn parse_kind(s: &str) -> Result<FileKind, String> {
 fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
     let t0 = std::time::Instant::now();
 
-    // If --root is set, prepend it to patterns.
-    let root_prefix = ga.root.as_deref().unwrap_or("");
-
-    // Expand braces in all patterns, prepend root.
-    let expanded: Vec<String> = ga
-        .patterns
-        .iter()
-        .flat_map(|p| expand_braces(p))
-        .map(|p| {
-            if root_prefix.is_empty() {
-                p
-            } else {
-                let sep = if root_prefix.ends_with('/') { "" } else { "/" };
-                format!("{}{}{}", root_prefix, sep, p)
+    // Normalize --root: "." and "./" mean the current directory.
+    let root = ga
+        .root
+        .as_deref()
+        .map(|r| if r.len() > 1 { r.trim_end_matches('/') } else { r })
+        .filter(|r| *r != "." && !r.is_empty());
+    let with_root = |p: &str| -> String {
+        let p = p.strip_prefix("./").unwrap_or(p);
+        match root {
+            Some(r) if !p.starts_with('/') => {
+                let sep = if r.ends_with('/') { "" } else { "/" };
+                format!("{}{}{}", r, sep, p)
             }
-        })
-        .collect();
-
-    let match_opts = MatchOptions {
-        require_literal_leading_dot: !ga.hidden,
-        ..MatchOptions::new()
+            _ => p.to_string(),
+        }
     };
 
-    let base_walk_opts = WalkOptions {
-        match_opts,
+    let patterns: Vec<String> = ga.patterns.iter().map(|p| with_root(p)).collect();
+
+    // Excludes containing `/` are paths relative to the root; bare names
+    // match at any depth.
+    let mut exclude = Vec::new();
+    for e in &ga.excludes {
+        for ep in globber::try_expand_braces(e).map_err(|e| e.to_string())? {
+            let ep = if ep.contains('/') { with_root(&ep) } else { ep };
+            exclude.push(globber::Pattern::new(&ep).map_err(|e| e.to_string())?);
+        }
+    }
+
+    // Kind and git-changed filters run inside the walk, before limits and
+    // budgets are charged.
+    let changed = match ga.git_changed {
+        Some(ref ref_name) => {
+            let root_dir = root.unwrap_or(".");
+            Some(globber::git::ChangedSet::new(
+                &globber::git::changed_files(std::path::Path::new(root_dir), ref_name)?,
+            ))
+        }
+        None => None,
+    };
+    let kinds = ga.kind_filter.clone();
+    let filter = if kinds.is_empty() && changed.is_none() {
+        None
+    } else {
+        Some(EntryFilter::new(move |e: &Entry| {
+            (kinds.is_empty() || kinds.contains(&e.kind))
+                && changed.as_ref().is_none_or(|c| c.contains(&e.path))
+        }))
+    };
+
+    let opts = WalkOptions {
+        match_opts: MatchOptions {
+            require_literal_leading_dot: !ga.hidden,
+            ..MatchOptions::new()
+        },
         sorted: ga.sorted,
         limit: ga.limit,
         byte_budget: ga.byte_budget,
@@ -283,110 +316,19 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
         max_depth: ga.max_depth,
         no_stat: ga.no_stat,
         gitignore: ga.gitignore,
+        follow_symlinks: ga.follow,
+        exclude,
+        filter,
         ..WalkOptions::default()
     };
 
-    // If we have excludes, use a Ruleset. Otherwise, simple walk.
-    let entries: Vec<Entry> = if !ga.excludes.is_empty() {
-        let mut builder = Ruleset::new();
-        for p in &expanded {
-            builder = builder.include(p);
-        }
-        for e in &ga.excludes {
-            for ep in expand_braces(e) {
-                builder = builder.exclude(&ep);
-            }
-        }
-        builder = builder.match_options(match_opts);
-        let ruleset = builder.build().map_err(|e| e.to_string())?;
-
-        // Walk with ** from root (or cwd), filter through ruleset.
-        let walk_pattern = if root_prefix.is_empty() {
-            "**".to_string()
-        } else {
-            let sep = if root_prefix.ends_with('/') { "" } else { "/" };
-            format!("{}{}**", root_prefix, sep)
-        };
-        let results = globber::walk(&walk_pattern, base_walk_opts).map_err(|e| e.to_string())?;
-        let all: Vec<Entry> = results.into_iter().filter_map(|r| r.ok()).collect();
-        ruleset
-            .filter(&all)
-            .into_iter()
-            .cloned()
-            .collect()
-    } else {
-        let mut all = Vec::new();
-        let mut remaining_opts = base_walk_opts.clone();
-        for p in &expanded {
-            let results = glob_with(p, remaining_opts.clone()).map_err(|e| e.to_string())?;
-            for r in results {
-                if let Ok(e) = r {
-                    // Subtract consumed budget for subsequent variants.
-                    if remaining_opts.token_budget > 0 {
-                        remaining_opts.token_budget =
-                            remaining_opts.token_budget.saturating_sub(e.tokens_est);
-                    }
-                    if remaining_opts.byte_budget > 0 {
-                        remaining_opts.byte_budget =
-                            remaining_opts.byte_budget.saturating_sub(e.size);
-                    }
-                    if remaining_opts.limit > 0 {
-                        remaining_opts.limit = remaining_opts.limit.saturating_sub(1);
-                    }
-                    all.push(e);
-                }
-            }
-            // Stop if budgets exhausted.
-            if remaining_opts.limit == 0 && base_walk_opts.limit > 0 {
-                break;
-            }
-            if remaining_opts.token_budget == 0 && base_walk_opts.token_budget > 0 {
-                break;
-            }
-            if remaining_opts.byte_budget == 0 && base_walk_opts.byte_budget > 0 {
-                break;
-            }
-        }
-        all
-    };
-
-    // Filter by kind.
-    let entries: Vec<Entry> = if ga.kind_filter.is_empty() {
-        entries
-    } else {
-        entries
-            .into_iter()
-            .filter(|e| ga.kind_filter.contains(&e.kind))
-            .collect()
-    };
-
-    // Filter by git-changed.
-    let owned: Vec<Entry> = if let Some(ref ref_name) = ga.git_changed {
-        let root_dir = ga.root.as_deref().unwrap_or(".");
-        let changed = globber::git::changed_files(
-            std::path::Path::new(root_dir),
-            ref_name,
-        )
-        .map_err(|e| e.to_string())?;
-        entries
-            .into_iter()
-            .filter(|e| {
-                // Canonicalize for comparison — changed_files returns absolute paths.
-                let canon = std::fs::canonicalize(&e.path).unwrap_or_else(|_| e.path.clone());
-                changed.iter().any(|c| {
-                    let c_canon = std::fs::canonicalize(c).unwrap_or_else(|_| c.clone());
-                    canon == c_canon
-                })
-            })
-            .collect()
-    } else {
-        entries
-    };
+    let results = globber::walk_many(&patterns, opts).map_err(|e| e.to_string())?;
+    let owned: Vec<Entry> = results.into_iter().filter_map(|r| r.ok()).collect();
 
     let elapsed = t0.elapsed();
     let budget = globber::BudgetInfo {
-        token_budget: ga.token_budget,
-        byte_budget: ga.byte_budget,
+        token_budget: ga.token_budget.unwrap_or(0),
+        byte_budget: ga.byte_budget.unwrap_or(0),
         wall_time_ms: elapsed.as_millis() as u64,
     };
 

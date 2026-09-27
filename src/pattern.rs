@@ -205,6 +205,21 @@ impl Pattern {
         &self.original
     }
 
+    /// The literal string this pattern matches, if it has no wildcards
+    /// (escapes resolved: `a\*b` → `a*b`).
+    pub fn literal(&self) -> Option<String> {
+        if self.has_meta {
+            return None;
+        }
+        self.tokens
+            .iter()
+            .map(|t| match t {
+                Token::Char(c) => Some(*c),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Escape metacharacters so the result matches the literal string.
     pub fn escape(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -266,74 +281,92 @@ fn parse_char_specs(s: &str) -> Vec<CharSpec> {
 
 // ── Brace expansion ─────────────────────────────────────────────────
 
+/// Upper bound on the number of patterns one brace expression may expand
+/// to. Expansion is multiplicative (`{a,b}{a,b}...`), so without a cap a
+/// short pattern could expand to millions of walks.
+pub const MAX_BRACE_EXPANSIONS: usize = 10_000;
+
 /// Expand brace expressions in a pattern string.
 ///
-/// `{a,b,c}` expands to three patterns. Braces can be nested.
-/// Returns the original string in a one-element vec if no braces.
+/// `{a,b,c}` expands to three patterns. Braces can be nested, and `\{`,
+/// `\}`, `\,` are literal. An unmatched `{` is left as-is. Returns the
+/// original string in a one-element vec if there are no braces, or if the
+/// expansion would exceed [`MAX_BRACE_EXPANSIONS`] (use
+/// [`try_expand_braces`] to detect that case).
 pub fn expand_braces(pattern: &str) -> Vec<String> {
-    let bytes = pattern.as_bytes();
-    // Find the first top-level `{`.
-    let mut depth = 0i32;
-    let mut brace_start = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && bytes[i - 1] == b'\\' {
-            continue;
+    try_expand_braces(pattern).unwrap_or_else(|_| vec![pattern.to_string()])
+}
+
+/// Like [`expand_braces`], but fails instead of expanding past
+/// [`MAX_BRACE_EXPANSIONS`] patterns.
+pub fn try_expand_braces(pattern: &str) -> Result<Vec<String>, PatternError> {
+    let mut out = Vec::new();
+    expand_into(pattern, &mut out)?;
+    Ok(out)
+}
+
+fn expand_into(pattern: &str, out: &mut Vec<String>) -> Result<(), PatternError> {
+    let Some((start, end)) = find_top_level_braces(pattern) else {
+        if out.len() >= MAX_BRACE_EXPANSIONS {
+            return Err(PatternError { pos: 0, kind: PatternErrorKind::TooManyExpansions });
         }
-        match b {
+        out.push(pattern.to_string());
+        return Ok(());
+    };
+    let prefix = &pattern[..start];
+    let suffix = &pattern[end + 1..];
+    for alt in split_brace_alternatives(&pattern[start + 1..end]) {
+        expand_into(&format!("{}{}{}", prefix, alt, suffix), out)?;
+    }
+    Ok(())
+}
+
+/// Byte offsets of the first balanced top-level `{`...`}` pair.
+fn find_top_level_braces(s: &str) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut open = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1, // Skip the escaped byte.
             b'{' => {
                 if depth == 0 {
-                    brace_start = Some(i);
+                    open = i;
                 }
                 depth += 1;
             }
-            b'}' => {
+            b'}' if depth > 0 => {
                 depth -= 1;
                 if depth == 0 {
-                    let start = brace_start.unwrap();
-                    let prefix = &pattern[..start];
-                    let suffix = &pattern[i + 1..];
-                    let inner = &pattern[start + 1..i];
-
-                    // Split inner by top-level commas.
-                    let alternatives = split_brace_alternatives(inner);
-                    let mut results = Vec::new();
-                    for alt in &alternatives {
-                        let expanded_suffix = expand_braces(suffix);
-                        let expanded_alt = expand_braces(&format!("{}{}", prefix, alt));
-                        for a in &expanded_alt {
-                            for s in &expanded_suffix {
-                                results.push(format!("{}{}", a, s));
-                            }
-                        }
-                    }
-                    return results;
+                    return Some((open, i));
                 }
             }
             _ => {}
         }
+        i += 1;
     }
-    // No braces found.
-    vec![pattern.to_string()]
+    None
 }
 
 fn split_brace_alternatives(s: &str) -> Vec<&str> {
     let bytes = s.as_bytes();
-    let mut depth = 0i32;
+    let mut depth = 0usize;
     let mut parts = Vec::new();
     let mut start = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && bytes[i - 1] == b'\\' {
-            continue;
-        }
-        match b {
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
             b'{' => depth += 1,
-            b'}' => depth -= 1,
+            b'}' => depth = depth.saturating_sub(1),
             b',' if depth == 0 => {
                 parts.push(&s[start..i]);
                 start = i + 1;
             }
             _ => {}
         }
+        i += 1;
     }
     parts.push(&s[start..]);
     parts

@@ -1,44 +1,100 @@
 // Filesystem walking — the POSIX glob(3) equivalent.
 //
-// v0.3: adds .gitignore integration, rayon-parallel readdir, depth control.
+// One engine drives every walk. Each directory is read once, and every
+// child is matched against the set of (pattern, component) states still
+// alive at that depth, so multiple patterns and brace alternatives share
+// a single traversal and can never yield the same path twice.
+//
+// Without a limit or budget, subdirectories fan out across rayon. With
+// one, the same engine runs depth-first in sorted order so it can stop
+// early. Both modes produce identical output: children are sorted by
+// name per directory, so pre-order traversal is globally path-sorted.
 
-use std::cmp;
-use std::ffi::OsString;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
 use crate::entry::Entry;
 use crate::error::GlobError;
+use crate::ignore::IgnoreStack;
 use crate::matcher::MatchOptions;
-use crate::pattern::Pattern;
+use crate::pattern::{try_expand_braces, Pattern};
+
+/// What to do when the next matched entry would overrun a byte or token budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetMode {
+    /// Stop the walk at the first entry that does not fit (default).
+    /// Enables early termination on large trees.
+    #[default]
+    Stop,
+    /// Skip entries that do not fit and keep walking, packing as many
+    /// entries as possible into the budget (in sorted order).
+    Fit,
+}
+
+/// A predicate applied to every matched entry before limits and budgets
+/// are charged, so filtered-out entries never consume them.
+#[derive(Clone)]
+pub struct EntryFilter(Arc<dyn Fn(&Entry) -> bool + Send + Sync>);
+
+impl EntryFilter {
+    pub fn new<F: Fn(&Entry) -> bool + Send + Sync + 'static>(f: F) -> Self {
+        EntryFilter(Arc::new(f))
+    }
+
+    pub fn matches(&self, entry: &Entry) -> bool {
+        (self.0)(entry)
+    }
+}
+
+impl fmt::Debug for EntryFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EntryFilter(..)")
+    }
+}
 
 /// Options for the filesystem walker.
 #[derive(Debug, Clone)]
 pub struct WalkOptions {
     /// Pattern matching options.
     pub match_opts: MatchOptions,
-    /// If true, return results in sorted order (default: true).
+    /// If true, return results in path-sorted order (default: true).
     pub sorted: bool,
-    /// If true, stop iteration on the first I/O error (POSIX GLOB_ERR).
+    /// If true, return the first I/O error instead of results (POSIX GLOB_ERR).
     pub stop_on_error: bool,
-    /// Maximum number of results to yield. 0 = unlimited.
-    pub limit: usize,
-    /// Maximum total bytes across all matched files. 0 = unlimited.
-    pub byte_budget: u64,
-    /// Maximum estimated tokens across all matched files. 0 = unlimited.
-    pub token_budget: u64,
-    /// If true, only match directories.
+    /// Maximum number of results to yield. `None` = unlimited.
+    pub limit: Option<usize>,
+    /// Maximum total bytes across all matched entries. `None` = unlimited.
+    pub byte_budget: Option<u64>,
+    /// Maximum estimated tokens across all matched entries. `None` = unlimited.
+    pub token_budget: Option<u64>,
+    /// Behavior when an entry would overrun a budget.
+    pub budget_mode: BudgetMode,
+    /// If true, only yield directories.
     pub only_dirs: bool,
-    /// If true, the pattern must match a directory (trailing `/`).
-    pub require_dir: bool,
-    /// Maximum recursion depth from the `**` boundary. 0 = unlimited.
-    pub max_depth: usize,
+    /// Maximum depth, counted from the first wildcard component: for
+    /// `src/**/*.rs`, depth 1 means files directly inside `src/`.
+    /// `None` = unlimited.
+    pub max_depth: Option<usize>,
     /// If true, skip full stat() — uses DirEntry file_type only.
     pub no_stat: bool,
-    /// If true, read .gitignore files and skip matching entries.
+    /// If true, honor .gitignore files, .git/info/exclude, and the global
+    /// git excludes file, and skip `.git` directories.
     pub gitignore: bool,
+    /// If true, descend into symlinked directories found while walking
+    /// (cycles are detected and skipped). Symlinks named literally in the
+    /// pattern are always followed.
+    pub follow_symlinks: bool,
+    /// Exclude patterns. A pattern containing `/` is matched against the
+    /// full entry path (with `*` not crossing `/`); one without `/` is
+    /// matched against the file name at any depth. Matching directories
+    /// are pruned along with everything under them.
+    pub exclude: Vec<Pattern>,
+    /// Extra predicate applied before limits and budgets are charged.
+    pub filter: Option<EntryFilter>,
 }
 
 impl Default for WalkOptions {
@@ -47,14 +103,17 @@ impl Default for WalkOptions {
             match_opts: MatchOptions::new(),
             sorted: true,
             stop_on_error: false,
-            limit: 0,
-            byte_budget: 0,
-            token_budget: 0,
+            limit: None,
+            byte_budget: None,
+            token_budget: None,
+            budget_mode: BudgetMode::Stop,
             only_dirs: false,
-            require_dir: false,
-            max_depth: 0,
+            max_depth: None,
             no_stat: false,
             gitignore: false,
+            follow_symlinks: false,
+            exclude: Vec::new(),
+            filter: None,
         }
     }
 }
@@ -63,212 +122,91 @@ impl Default for WalkOptions {
 pub type WalkResult = Result<Entry, GlobError>;
 
 /// Walk the filesystem matching a pattern, returning all matched entries.
+///
+/// Brace expressions are expanded, and all alternatives share one walk.
 pub fn walk(pattern: &str, opts: WalkOptions) -> Result<Vec<WalkResult>, GlobError> {
-    let pat = Pattern::new(pattern)?;
-    walk_pattern(&pat, pattern, opts)
+    walk_many(&[pattern], opts)
 }
 
 /// Walk using a pre-compiled pattern.
-pub fn walk_pattern(
-    _pat: &Pattern,
-    pattern: &str,
+pub fn walk_pattern(pat: &Pattern, opts: WalkOptions) -> Result<Vec<WalkResult>, GlobError> {
+    walk(pat.as_str(), opts)
+}
+
+/// Walk the filesystem matching any of several patterns in a single pass.
+///
+/// Each path is yielded at most once, even if several patterns match it.
+pub fn walk_many<S: AsRef<str>>(
+    patterns: &[S],
     opts: WalkOptions,
 ) -> Result<Vec<WalkResult>, GlobError> {
-    let (root, components) = split_pattern(pattern)?;
-    let scope = if root.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        root
-    };
-
-    // Load root-level .gitignore if requested.
-    let mut ignores: Vec<IgnoreRules> = Vec::new();
-    if opts.gitignore {
-        let mut root_rules = Vec::new();
-        root_rules.push(IgnoreRule {
-            pattern: Pattern::new("**/.git").unwrap_or_else(|_| Pattern::new("*").unwrap()),
-            negated: false,
-        });
-        let gi_path = if scope == Path::new(".") {
-            PathBuf::from(".gitignore")
-        } else {
-            scope.join(".gitignore")
-        };
-        if let Some(rules) = load_gitignore(&gi_path) {
-            root_rules.extend(rules.rules);
-        }
-        ignores.push(IgnoreRules { rules: root_rules });
-    }
-
-    // Also load .gitignore files along the literal prefix path.
-    if opts.gitignore {
-        let mut prefix_path = scope.clone();
-        for comp in &components {
-            if comp.has_meta {
-                break;
-            }
-            prefix_path = prefix_path.join(comp.as_str());
-            if let Some(gi) = load_gitignore(&prefix_path.join(".gitignore")) {
-                ignores.push(gi);
+    // Expand braces, compile, and group patterns by their root ("", "/", ...).
+    let mut groups: Vec<(PathBuf, Vec<Compiled>)> = Vec::new();
+    for p in patterns {
+        for expanded in try_expand_braces(p.as_ref())? {
+            let (root, compiled) = compile(&expanded)?;
+            match groups.iter_mut().find(|(r, _)| *r == root) {
+                Some((_, pats)) => pats.push(compiled),
+                None => groups.push((root, vec![compiled])),
             }
         }
     }
 
-    // ── Parallel fast path ──────────────────────────────────────────
-    // For patterns like `prefix/**/*.rs` with no budget, fan out the
-    // entire walk across rayon threads.
-    if let Some((rec_idx, _tail_len)) = can_use_parallel_walker(&components, &opts) {
-        // Resolve the literal prefix to the actual directory.
-        let mut walk_root = scope.clone();
-        for comp in &components[..rec_idx] {
-            walk_root = walk_root.join(comp.as_str());
-        }
-
-        let tail = &components[rec_idx + 1..];
-        let results_mutex = Mutex::new(Vec::<WalkResult>::new());
-
-        parallel_recursive_walk(&walk_root, tail, 0, &opts, &ignores, &results_mutex);
-
-        let mut results = results_mutex.into_inner().unwrap();
-        if opts.sorted {
-            results.sort_by(|a, b| {
-                let pa = a.as_ref().map(|e| &e.path).ok();
-                let pb = b.as_ref().map(|e| &e.path).ok();
-                pa.cmp(&pb)
-            });
-        }
-        return Ok(results);
-    }
-
-    // ── Sequential walker (budget-aware, supports complex patterns) ─
-    let mut results: Vec<WalkResult> = Vec::new();
-    let mut bytes_used: u64 = 0;
-    let mut tokens_used: u64 = 0;
-
-    let mut todo: Vec<TodoItem> = Vec::new();
-
-    if !components.is_empty() {
-        fill_todo(
-            &mut todo, &components, 0, &scope, true, 0, &opts, &ignores,
-        );
-    }
-
-    while let Some(item) = todo.pop() {
-        if opts.limit > 0 && results.len() >= opts.limit {
+    let parallel =
+        opts.limit.is_none() && opts.byte_budget.is_none() && opts.token_budget.is_none();
+    let mut sink = Sink::new(&opts);
+    for (root, pats) in &groups {
+        if sink.stopped {
             break;
         }
-
-        match item {
-            TodoItem::Error(e) => {
-                if opts.stop_on_error {
-                    return Err(e);
-                }
-                results.push(Err(e));
-            }
-            TodoItem::Verified(entry) => {
-                if opts.require_dir && !entry.is_dir {
-                    continue;
-                }
-                if opts.only_dirs && !entry.is_dir {
-                    continue;
-                }
-                if !check_budget(&entry, &opts, &mut bytes_used, &mut tokens_used) {
-                    break;
-                }
-                results.push(Ok(entry));
-            }
-            TodoItem::Match(entry, idx, depth, dir_ignores) => {
-                let mut idx = idx;
-
-                if components[idx].is_recursive {
-                    let mut next = idx;
-                    while next + 1 < components.len() && components[next + 1].is_recursive {
-                        next += 1;
-                    }
-
-                    if entry.is_dir {
-                        if opts.max_depth == 0 || depth < opts.max_depth {
-                            // Load .gitignore from this directory if present.
-                            let mut child_ignores = dir_ignores.clone();
-                            if opts.gitignore {
-                                if let Some(gi) = load_gitignore(&entry.path.join(".gitignore")) {
-                                    child_ignores.push(gi);
-                                }
-                            }
-                            fill_todo(
-                                &mut todo, &components, next, &entry.path,
-                                true, depth + 1, &opts, &child_ignores,
-                            );
-                        }
-
-                        if next == components.len() - 1 {
-                            if !check_budget(&entry, &opts, &mut bytes_used, &mut tokens_used) {
-                                break;
-                            }
-                            results.push(Ok(entry));
-                            continue;
-                        } else {
-                            idx = next + 1;
-                        }
-                    } else if next == components.len() - 1 {
-                        if !check_budget(&entry, &opts, &mut bytes_used, &mut tokens_used) {
-                            break;
-                        }
-                        results.push(Ok(entry));
-                        continue;
-                    } else {
-                        idx = next + 1;
-                    }
-                }
-
-                let filename = match entry.path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n,
-                    None => continue,
-                };
-
-                if components[idx].matches_with(filename, opts.match_opts) {
-                    if idx == components.len() - 1 {
-                        if opts.require_dir && !entry.is_dir {
-                            continue;
-                        }
-                        if opts.only_dirs && !entry.is_dir {
-                            continue;
-                        }
-                        if !check_budget(&entry, &opts, &mut bytes_used, &mut tokens_used) {
-                            break;
-                        }
-                        results.push(Ok(entry));
-                    } else if entry.is_dir {
-                        let mut child_ignores = dir_ignores;
-                        if opts.gitignore {
-                            if let Some(gi) = load_gitignore(&entry.path.join(".gitignore")) {
-                                child_ignores.push(gi);
-                            }
-                        }
-                        fill_todo(
-                            &mut todo, &components, idx + 1, &entry.path,
-                            true, depth, &opts, &child_ignores,
-                        );
-                    }
-                }
-            }
-        }
+        let walker = Walker { opts: &opts, pats, parallel };
+        walker.walk_root(root, &mut sink);
     }
 
+    let mut results = sink.results;
+    if groups.len() > 1 && opts.sorted {
+        results.sort_by(|a, b| result_path(a).cmp(result_path(b)));
+        results.dedup_by(|a, b| {
+            matches!((&*a, &*b), (Ok(x), Ok(y)) if x.path == y.path)
+        });
+    }
+    if opts.stop_on_error {
+        if let Some(pos) = results.iter().position(|r| r.is_err()) {
+            return Err(results.swap_remove(pos).unwrap_err());
+        }
+    }
     Ok(results)
 }
 
-// ── Internals ────────────────────────────────────────────────────────
-
-enum TodoItem {
-    Verified(Entry),
-    /// (entry, component_idx, depth, accumulated_ignores)
-    Match(Entry, usize, usize, Vec<IgnoreRules>),
-    Error(GlobError),
+fn result_path(r: &WalkResult) -> &Path {
+    match r {
+        Ok(e) => &e.path,
+        Err(GlobError::Io { path, .. }) => path,
+        Err(GlobError::Pattern(_)) => Path::new(""),
+    }
 }
 
-/// Split pattern into a literal root prefix and per-component patterns.
-fn split_pattern(pattern: &str) -> Result<(PathBuf, Vec<Pattern>), GlobError> {
+// ── Pattern compilation ──────────────────────────────────────────────
+
+/// One pattern, split into per-component matchers.
+struct Compiled {
+    comps: Vec<Pattern>,
+    /// Number of leading components with no metacharacters.
+    prefix_len: usize,
+    /// Pattern ended in `/`: only directories match.
+    require_dir: bool,
+}
+
+/// A live matching position: (pattern index, component index).
+type State = (usize, usize);
+
+/// Split a pattern into its literal root (`/`, a Windows prefix, or empty)
+/// and per-component patterns. `.` components are dropped so `./src/*`
+/// and `src/*` produce identical paths; runs of `**` collapse to one.
+fn compile(pattern: &str) -> Result<(PathBuf, Compiled), GlobError> {
+    // Validate the whole pattern first so error positions refer to it.
+    Pattern::new(pattern)?;
+
     let mut root = PathBuf::new();
     let mut rest_start = 0;
 
@@ -284,451 +222,524 @@ fn split_pattern(pattern: &str) -> Result<(PathBuf, Vec<Pattern>), GlobError> {
             let prefix_str = pfx.as_os_str().to_str().unwrap_or("");
             root.push(prefix_str);
             rest_start = prefix_str.len();
-            if rest_start < pattern.len()
-                && pattern.as_bytes().get(rest_start) == Some(&b'\\')
-            {
+            if pattern.as_bytes().get(rest_start) == Some(&b'\\') {
                 root.push("\\");
                 rest_start += 1;
             }
         }
     }
 
-    let rest = &pattern[cmp::min(rest_start, pattern.len())..];
-    let mut components = Vec::new();
-    for component_str in rest.split_terminator(|c: char| c == '/' || (cfg!(windows) && c == '\\'))
-    {
-        if !component_str.is_empty() {
-            components.push(Pattern::new(component_str)?);
-        }
-    }
-
-    Ok((root, components))
-}
-
-/// Populate the work stack for matching at `components[idx]`.
-fn fill_todo(
-    todo: &mut Vec<TodoItem>,
-    components: &[Pattern],
-    idx: usize,
-    dir_path: &Path,
-    is_dir: bool,
-    depth: usize,
-    opts: &WalkOptions,
-    ignores: &[IgnoreRules],
-) {
-    let pattern = &components[idx];
-    let curdir = dir_path == Path::new(".");
-
-    // Depth check: only for recursive (**) walks.
-    if pattern.is_recursive && opts.max_depth > 0 && depth >= opts.max_depth {
-        return;
-    }
-
-    if !pattern.has_meta {
-        // FAST PATH: literal component — stat only.
-        let s = pattern.as_str();
-        let special = s == "." || s == "..";
-        let child_path = if curdir {
-            PathBuf::from(s)
-        } else {
-            dir_path.join(s)
-        };
-
-        let exists = if special && is_dir {
-            true
-        } else {
-            fs::metadata(&child_path).is_ok() || fs::symlink_metadata(&child_path).is_ok()
-        };
-
-        if exists {
-            let entry = if opts.no_stat {
-                Entry::from_path_lightweight(child_path)
-            } else {
-                Entry::from_path(child_path)
-            };
-            if idx + 1 == components.len() {
-                todo.push(TodoItem::Verified(entry));
-            } else if entry.is_dir {
-                // Pick up .gitignore from literal directories along the path.
-                if opts.gitignore {
-                    let mut child_ignores = ignores.to_vec();
-                    if let Some(gi) = load_gitignore(&entry.path.join(".gitignore")) {
-                        child_ignores.push(gi);
-                    }
-                    fill_todo(todo, components, idx + 1, &entry.path, true, depth, opts, &child_ignores);
-                } else {
-                    fill_todo(todo, components, idx + 1, &entry.path, true, depth, opts, ignores);
-                }
-            }
-        }
-    } else if is_dir {
-        // READDIR PATH: enumerate children, stat in parallel with rayon.
-        match fs::read_dir(dir_path) {
-            Ok(rd) => {
-                // Collect DirEntry objects first (readdir is sequential).
-                let dir_entries: Vec<_> = rd.filter_map(|r| r.ok()).collect();
-
-                // Build (path, filename, entry) tuples — rayon parallelizes stat.
-                let children: Vec<(Entry, OsString)> = dir_entries
-                    .into_par_iter()
-                    .filter_map(|de| {
-                        let path = if curdir {
-                            PathBuf::from(de.file_name())
-                        } else {
-                            de.path()
-                        };
-                        let filename = de.file_name();
-
-                        // Filter leading dots early.
-                        if opts.match_opts.require_literal_leading_dot {
-                            if let Some(name) = filename.to_str() {
-                                if name.starts_with('.') {
-                                    return None;
-                                }
-                            }
-                        }
-
-                        // Gitignore check.
-                        if !ignores.is_empty() {
-                            if let Some(name) = path.to_str() {
-                                if is_gitignored(ignores, name) {
-                                    return None;
-                                }
-                            }
-                        }
-
-                        let entry = if opts.no_stat {
-                            Entry::from_dir_entry_lightweight(path, &de)
-                        } else {
-                            Entry::from_dir_entry(path, &de)
-                        };
-                        Some((entry, filename))
-                    })
-                    .collect();
-
-                // Sort needs to be sequential (for deterministic order).
-                let mut children = children;
-                if opts.sorted {
-                    children.sort_by(|a, b| b.1.cmp(&a.1));
-                }
-
-                let ignores_vec: Vec<IgnoreRules> = ignores.to_vec();
-                for (entry, _filename) in children {
-                    todo.push(TodoItem::Match(entry, idx, depth, ignores_vec.clone()));
-                }
-
-                // Handle `.` and `..`.
-                if !pattern.tokens.is_empty()
-                    && pattern.tokens[0] == crate::pattern::Token::Char('.')
-                {
-                    for special in &[".", ".."] {
-                        if pattern.matches_with(special, opts.match_opts) {
-                            let sp = dir_path.join(special);
-                            let entry = Entry::from_path(sp);
-                            if idx + 1 == components.len() {
-                                todo.push(TodoItem::Verified(entry));
-                            } else {
-                                fill_todo(
-                                    todo, components, idx + 1, &entry.path,
-                                    entry.is_dir, depth + 1, opts, ignores,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                todo.push(TodoItem::Error(GlobError::Io {
-                    path: dir_path.to_path_buf(),
-                    error: e,
-                }));
-            }
-        }
-    }
-}
-
-fn check_budget(
-    entry: &Entry,
-    opts: &WalkOptions,
-    bytes_used: &mut u64,
-    tokens_used: &mut u64,
-) -> bool {
-    if opts.byte_budget > 0 {
-        if *bytes_used + entry.size > opts.byte_budget {
-            return false;
-        }
-        *bytes_used += entry.size;
-    }
-    if opts.token_budget > 0 {
-        if *tokens_used + entry.tokens_est > opts.token_budget {
-            return false;
-        }
-        *tokens_used += entry.tokens_est;
-    }
-    true
-}
-
-// ── Parallel recursive walker ────────────────────────────────────────
-//
-// When the pattern contains ** and there's no budget constraint,
-// we can parallelize the entire directory tree walk — not just stat
-// calls, but readdir itself. This fans out across rayon threads so
-// multiple directories are read concurrently.
-
-use std::sync::Mutex;
-
-/// Recursively walk a directory tree in parallel, collecting entries
-/// that match the tail pattern (the part after **).
-fn parallel_recursive_walk(
-    dir: &Path,
-    tail: &[Pattern],
-    depth: usize,
-    opts: &WalkOptions,
-    ignores: &[IgnoreRules],
-    results: &Mutex<Vec<WalkResult>>,
-) {
-    let rd = match fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(e) => {
-            results.lock().unwrap().push(Err(GlobError::Io {
-                path: dir.to_path_buf(),
-                error: e,
-            }));
-            return;
-        }
-    };
-
-    // Collect dir entries (readdir itself is sequential per directory).
-    let dir_entries: Vec<_> = rd.filter_map(|r| r.ok()).collect();
-
-    // Process entries in parallel — each may trigger recursive descent.
-    dir_entries.into_par_iter().for_each(|de| {
-        let path = de.path();
-        let filename = de.file_name();
-
-        // Leading dot filter.
-        if opts.match_opts.require_literal_leading_dot {
-            if let Some(name) = filename.to_str() {
-                if name.starts_with('.') {
-                    return;
-                }
-            }
-        }
-
-        // Gitignore check.
-        if !ignores.is_empty() {
-            if let Some(name) = path.to_str() {
-                if is_gitignored(ignores, name) {
-                    return;
-                }
-            }
-        }
-
-        let entry = if opts.no_stat {
-            Entry::from_dir_entry_lightweight(path.clone(), &de)
-        } else {
-            Entry::from_dir_entry(path.clone(), &de)
-        };
-
-        if entry.is_dir {
-            // Check if this directory matches the tail pattern (for ** as last).
-            if tail.is_empty() {
-                if !opts.only_dirs || entry.is_dir {
-                    results.lock().unwrap().push(Ok(entry.clone()));
-                }
-            }
-
-            // Depth check.
-            if opts.max_depth > 0 && depth >= opts.max_depth {
-                return;
-            }
-
-            // Recurse into subdirectory — this is where parallelism helps.
-            let mut child_ignores;
-            let ig = if opts.gitignore {
-                child_ignores = ignores.to_vec();
-                if let Some(gi) = load_gitignore(&path.join(".gitignore")) {
-                    child_ignores.push(gi);
-                }
-                &child_ignores[..]
-            } else {
-                // Shadow to extend lifetime.
-                child_ignores = ignores.to_vec();
-                &child_ignores[..]
-            };
-            parallel_recursive_walk(&path, tail, depth + 1, opts, ig, results);
-        }
-
-        // Check tail pattern match.
-        if tail.is_empty() {
-            // ** alone — yield everything.
-            if !entry.is_dir {
-                if !opts.only_dirs {
-                    results.lock().unwrap().push(Ok(entry));
-                }
-            }
-        } else {
-            // Match filename against the tail pattern(s).
-            let fname = match entry.path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
-                None => return,
-            };
-            // Simple case: single tail component (e.g. *.rs after **).
-            if tail.len() == 1 {
-                if tail[0].matches_with(fname, opts.match_opts) {
-                    if opts.require_dir && !entry.is_dir {
-                        return;
-                    }
-                    if opts.only_dirs && !entry.is_dir {
-                        return;
-                    }
-                    results.lock().unwrap().push(Ok(entry));
-                }
-            }
-            // Multi-component tail would need sub-walking, but the common
-            // case (e.g. **/*.rs) is single-component. For multi-component
-            // tails, fall back to the sequential walker.
-        }
-    });
-}
-
-/// Check if a pattern qualifies for the parallel walker:
-/// - Contains **
-/// - No budget constraints (budget requires sequential early-exit)
-/// - At most one component after **
-fn can_use_parallel_walker(components: &[Pattern], opts: &WalkOptions) -> Option<(usize, usize)> {
-    if opts.token_budget > 0 || opts.byte_budget > 0 || opts.limit > 0 {
-        return None; // Budget needs sequential early-exit.
-    }
-
-    // Find the ** component.
-    let rec_idx = components.iter().position(|c| c.is_recursive)?;
-
-    // All components before ** must be literal (no metacharacters).
-    if components[..rec_idx].iter().any(|c| c.has_meta) {
-        return None;
-    }
-
-    // At most one component after **.
-    let tail_len = components.len() - rec_idx - 1;
-    if tail_len > 1 {
-        return None; // Multi-component tail not supported by parallel walker.
-    }
-
-    Some((rec_idx, tail_len))
-}
-
-// ── Gitignore support ────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-struct IgnoreRule {
-    pattern: Pattern,
-    negated: bool,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct IgnoreRules {
-    rules: Vec<IgnoreRule>,
-}
-
-/// Load and parse a .gitignore file into ignore rules.
-fn load_gitignore(path: &Path) -> Option<IgnoreRules> {
-    let content = fs::read_to_string(path).ok()?;
-    let mut rules = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    let rest = &pattern[rest_start.min(pattern.len())..];
+    let mut comps: Vec<Pattern> = Vec::new();
+    for s in rest.split(|c: char| c == '/' || (cfg!(windows) && c == '\\')) {
+        if s.is_empty() || s == "." {
             continue;
         }
-        let (negated, pat_str) = if let Some(rest) = line.strip_prefix('!') {
-            (true, rest)
-        } else {
-            (false, line)
-        };
-        // Strip leading `/` (gitignore root-anchor) and trailing `/` (dir-only hint).
-        let pat_str = pat_str.strip_prefix('/').unwrap_or(pat_str);
-        let pat_str = pat_str.strip_suffix('/').unwrap_or(pat_str);
-        // Patterns without `/` match anywhere; patterns with `/` are path-relative.
-        let glob_pat = if pat_str.contains('/') {
-            format!("**/{}", pat_str)
-        } else {
-            format!("**/{}", pat_str)
-        };
-        if let Ok(pattern) = Pattern::new(&glob_pat) {
-            rules.push(IgnoreRule { pattern, negated });
+        let comp = Pattern::new(s)?;
+        if comp.is_recursive && comps.last().is_some_and(|c| c.is_recursive) {
+            continue;
+        }
+        comps.push(comp);
+    }
+
+    let prefix_len = comps.iter().take_while(|c| !c.has_meta).count();
+    let require_dir = rest.len() > 1 && rest.ends_with('/');
+    Ok((root, Compiled { comps, prefix_len, require_dir }))
+}
+
+// ── Output sink (limits and budgets) ─────────────────────────────────
+
+struct Sink {
+    results: Vec<WalkResult>,
+    limit: Option<usize>,
+    byte_budget: Option<u64>,
+    token_budget: Option<u64>,
+    mode: BudgetMode,
+    stop_on_error: bool,
+    count: usize,
+    bytes: u64,
+    tokens: u64,
+    stopped: bool,
+}
+
+impl Sink {
+    fn new(opts: &WalkOptions) -> Self {
+        Sink {
+            results: Vec::new(),
+            limit: opts.limit,
+            byte_budget: opts.byte_budget,
+            token_budget: opts.token_budget,
+            mode: opts.budget_mode,
+            stop_on_error: opts.stop_on_error,
+            count: 0,
+            bytes: 0,
+            tokens: 0,
+            stopped: false,
         }
     }
-    if rules.is_empty() {
-        None
-    } else {
-        Some(IgnoreRules { rules })
+
+    /// An unbounded collector for one parallel subtree.
+    fn collector(stop_on_error: bool) -> Self {
+        Sink {
+            results: Vec::new(),
+            limit: None,
+            byte_budget: None,
+            token_budget: None,
+            mode: BudgetMode::Stop,
+            stop_on_error,
+            count: 0,
+            bytes: 0,
+            tokens: 0,
+            stopped: false,
+        }
+    }
+
+    fn push_entry(&mut self, entry: Entry) {
+        if self.stopped {
+            return;
+        }
+        let over_bytes = self.byte_budget.is_some_and(|b| self.bytes + entry.size > b);
+        let over_tokens = self
+            .token_budget
+            .is_some_and(|b| self.tokens + entry.tokens_est > b);
+        if over_bytes || over_tokens {
+            if self.mode == BudgetMode::Stop {
+                self.stopped = true;
+            }
+            return;
+        }
+        self.bytes += entry.size;
+        self.tokens += entry.tokens_est;
+        self.count += 1;
+        self.results.push(Ok(entry));
+        if self.limit.is_some_and(|l| self.count >= l) {
+            self.stopped = true;
+        }
+    }
+
+    fn push_err(&mut self, err: GlobError) {
+        if self.stopped {
+            return;
+        }
+        self.results.push(Err(err));
+        if self.stop_on_error {
+            self.stopped = true;
+        }
+    }
+
+    fn absorb(&mut self, other: Sink) {
+        self.results.extend(other.results);
+        self.stopped |= other.stopped;
     }
 }
 
-/// Check if a path is ignored by any of the accumulated ignore rule sets.
-fn is_gitignored(ignore_stack: &[IgnoreRules], path: &str) -> bool {
-    let mut ignored = false;
-    // Also check just the filename for patterns like `*.o`.
-    let filename = Path::new(path)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or(path);
+// ── The walker ───────────────────────────────────────────────────────
 
-    for ruleset in ignore_stack {
-        for rule in &ruleset.rules {
-            if rule.pattern.matches(path) || rule.pattern.matches(filename) {
-                ignored = !rule.negated;
+struct Walker<'a> {
+    opts: &'a WalkOptions,
+    pats: &'a [Compiled],
+    parallel: bool,
+}
+
+/// A child of a directory that matched at least one live state.
+struct Child {
+    entry: Entry,
+    is_result: bool,
+    /// States to match this directory's children against. Empty = don't descend.
+    next: Vec<State>,
+}
+
+/// Canonical paths of the directories above the current one, used to
+/// detect symlink cycles when following symlinks.
+#[derive(Clone, Default)]
+struct Ancestors(Option<Arc<(PathBuf, Ancestors)>>);
+
+impl Ancestors {
+    fn contains(&self, p: &Path) -> bool {
+        let mut cur = &self.0;
+        while let Some(node) = cur {
+            if node.0 == p {
+                return true;
+            }
+            cur = &node.1 .0;
+        }
+        false
+    }
+
+    fn push(&self, p: PathBuf) -> Ancestors {
+        Ancestors(Some(Arc::new((p, self.clone()))))
+    }
+}
+
+impl Walker<'_> {
+    fn walk_root(&self, root: &Path, sink: &mut Sink) {
+        let scope = if root.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            root.to_path_buf()
+        };
+
+        // A pattern with no components (".", "/") names the root itself.
+        if self.pats.iter().any(|p| p.comps.is_empty()) && fs::symlink_metadata(&scope).is_ok() {
+            sink.push_entry(self.make_entry(scope.clone(), None));
+        }
+
+        let mut states = Vec::new();
+        for (p, pat) in self.pats.iter().enumerate() {
+            if !pat.comps.is_empty() {
+                self.add_state(&mut states, p, 0);
+            }
+        }
+        if states.is_empty() {
+            return;
+        }
+
+        let ignores = if self.opts.gitignore {
+            IgnoreStack::for_walk_root(&scope)
+        } else {
+            IgnoreStack::default()
+        };
+        let ancestors = if self.opts.follow_symlinks {
+            let canon = fs::canonicalize(&scope).unwrap_or_else(|_| scope.clone());
+            Ancestors::default().push(canon)
+        } else {
+            Ancestors::default()
+        };
+        self.visit_dir(&scope, 0, &states, &ignores, &ancestors, sink);
+    }
+
+    /// Add a state, plus the zero-component closure if it is `**`.
+    fn add_state(&self, states: &mut Vec<State>, p: usize, i: usize) {
+        if !states.contains(&(p, i)) {
+            states.push((p, i));
+        }
+        let comps = &self.pats[p].comps;
+        if comps[i].is_recursive && i + 1 < comps.len() && !states.contains(&(p, i + 1)) {
+            states.push((p, i + 1));
+        }
+    }
+
+    fn depth_ok(&self, p: usize, level: usize) -> bool {
+        match self.opts.max_depth {
+            Some(d) => level.saturating_sub(self.pats[p].prefix_len) <= d,
+            None => true,
+        }
+    }
+
+    fn visit_dir(
+        &self,
+        dir: &Path,
+        level: usize,
+        states: &[State],
+        ignores: &IgnoreStack,
+        ancestors: &Ancestors,
+        sink: &mut Sink,
+    ) {
+        let ignores = if self.opts.gitignore {
+            ignores.enter_dir(dir)
+        } else {
+            ignores.clone()
+        };
+
+        let children = match self.children(dir, level, states, &ignores) {
+            Ok(c) => c,
+            Err(error) => {
+                sink.push_err(GlobError::Io { path: dir.to_path_buf(), error });
+                return;
+            }
+        };
+
+        if self.parallel {
+            let parts: Vec<Sink> = children
+                .into_par_iter()
+                .map(|c| {
+                    let mut s = Sink::collector(self.opts.stop_on_error);
+                    self.visit_child(c, level, &ignores, ancestors, &mut s);
+                    s
+                })
+                .collect();
+            for part in parts {
+                sink.absorb(part);
+            }
+        } else {
+            for c in children {
+                if sink.stopped {
+                    return;
+                }
+                self.visit_child(c, level, &ignores, ancestors, sink);
             }
         }
     }
-    ignored
+
+    fn visit_child(
+        &self,
+        child: Child,
+        level: usize,
+        ignores: &IgnoreStack,
+        ancestors: &Ancestors,
+        sink: &mut Sink,
+    ) {
+        let Child { entry, is_result, next } = child;
+        let descend_path = if next.is_empty() { None } else { Some(entry.path.clone()) };
+
+        if is_result
+            && (!self.opts.only_dirs || entry.is_dir)
+            && self.opts.filter.as_ref().is_none_or(|f| f.matches(&entry))
+        {
+            sink.push_entry(entry);
+        }
+
+        if let Some(path) = descend_path {
+            if sink.stopped {
+                return;
+            }
+            let ancestors = if self.opts.follow_symlinks {
+                let canon = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if ancestors.contains(&canon) {
+                    return; // Symlink cycle.
+                }
+                ancestors.push(canon)
+            } else {
+                ancestors.clone()
+            };
+            self.visit_dir(&path, level + 1, &next, ignores, &ancestors, sink);
+        }
+    }
+
+    /// Enumerate and classify the children of `dir` against `states`.
+    fn children(
+        &self,
+        dir: &Path,
+        level: usize,
+        states: &[State],
+        ignores: &IgnoreStack,
+    ) -> std::io::Result<Vec<Child>> {
+        // Fast path: every live state is a literal name — stat, don't readdir.
+        let literals: Option<Vec<String>> = if self.opts.match_opts.case_sensitive {
+            states
+                .iter()
+                .map(|&(p, i)| self.pats[p].comps[i].literal())
+                .collect()
+        } else {
+            None
+        };
+
+        let mut children: Vec<Child> = if let Some(mut names) = literals {
+            names.sort();
+            names.dedup();
+            names
+                .into_par_iter()
+                .filter_map(|name| {
+                    let path = join(dir, &name);
+                    let meta = fs::symlink_metadata(&path).ok()?;
+                    let is_symlink = meta.file_type().is_symlink();
+                    let is_dir = if is_symlink {
+                        fs::metadata(&path).is_ok_and(|m| m.is_dir())
+                    } else {
+                        meta.is_dir()
+                    };
+                    self.classify(&name, path, is_dir, is_symlink, None, level, states, ignores)
+                })
+                .collect()
+        } else {
+            let dir_entries: Vec<fs::DirEntry> =
+                fs::read_dir(dir)?.filter_map(|r| r.ok()).collect();
+            dir_entries
+                .into_par_iter()
+                .filter_map(|de| {
+                    let name = de.file_name();
+                    let name = name.to_str()?;
+                    let ft = de.file_type().ok()?;
+                    let path = join(dir, name);
+                    let is_symlink = ft.is_symlink();
+                    let is_dir = if is_symlink {
+                        fs::metadata(&path).is_ok_and(|m| m.is_dir())
+                    } else {
+                        ft.is_dir()
+                    };
+                    self.classify(name, path, is_dir, is_symlink, Some(&de), level, states, ignores)
+                })
+                .collect()
+        };
+
+        if self.opts.sorted {
+            children.sort_by(|a, b| a.entry.path.file_name().cmp(&b.entry.path.file_name()));
+        }
+        Ok(children)
+    }
+
+    /// Decide whether a child is a result and which states survive into it.
+    /// Returns None for children that neither match nor lead anywhere,
+    /// before any stat() is spent on them.
+    #[allow(clippy::too_many_arguments)]
+    fn classify(
+        &self,
+        name: &str,
+        path: PathBuf,
+        is_dir: bool,
+        is_symlink: bool,
+        de: Option<&fs::DirEntry>,
+        level: usize,
+        states: &[State],
+        ignores: &IgnoreStack,
+    ) -> Option<Child> {
+        let child_level = level + 1;
+        let mopts = self.opts.match_opts;
+        let hidden = mopts.require_literal_leading_dot && name.starts_with('.');
+
+        let mut next: Vec<State> = Vec::new();
+        let mut matched = false;
+        let mut explicit = true; // Reached only through literal-prefix components.
+
+        for &(p, i) in states {
+            if !self.depth_ok(p, child_level) {
+                continue;
+            }
+            let pat = &self.pats[p];
+            let comp = &pat.comps[i];
+            let last = i + 1 == pat.comps.len();
+            let hit = if comp.is_recursive {
+                if hidden {
+                    continue;
+                }
+                // `**` consumes this component and stays live below it.
+                self.add_state(&mut next, p, i);
+                last
+            } else if comp.matches_with(name, mopts) {
+                if !last {
+                    self.add_state(&mut next, p, i + 1);
+                }
+                last
+            } else {
+                continue;
+            };
+            if i >= pat.prefix_len {
+                explicit = false;
+            }
+            if hit && (is_dir || !pat.require_dir) {
+                matched = true;
+            }
+        }
+
+        if !is_dir || (is_symlink && !self.opts.follow_symlinks && !explicit) {
+            next.clear();
+        }
+        // Drop states that could only match beyond max_depth.
+        next.retain(|&(p, _)| self.depth_ok(p, child_level + 1));
+
+        if !matched && next.is_empty() {
+            return None;
+        }
+
+        if self.opts.gitignore
+            && !explicit
+            && (name == ".git" || ignores.is_ignored(&path, is_dir))
+        {
+            return None;
+        }
+        if self.is_excluded(&path, name, is_dir) {
+            return None;
+        }
+
+        let entry = if matched {
+            match (de, self.opts.no_stat) {
+                (Some(de), false) => Entry::from_dir_entry(path, de),
+                (Some(de), true) => Entry::from_dir_entry_lightweight(path, de),
+                (None, _) => self.make_entry(path, None),
+            }
+        } else {
+            // Only descending through it: skip the stat.
+            Entry::bare_dir(path, is_symlink)
+        };
+
+        Some(Child { entry, is_result: matched, next })
+    }
+
+    fn make_entry(&self, path: PathBuf, de: Option<&fs::DirEntry>) -> Entry {
+        match (de, self.opts.no_stat) {
+            (Some(de), false) => Entry::from_dir_entry(path, de),
+            (Some(de), true) => Entry::from_dir_entry_lightweight(path, de),
+            (None, false) => Entry::from_path(path),
+            (None, true) => Entry::from_path_lightweight(path),
+        }
+    }
+
+    fn is_excluded(&self, path: &Path, name: &str, is_dir: bool) -> bool {
+        if self.opts.exclude.is_empty() {
+            return false;
+        }
+        let path_opts = MatchOptions {
+            case_sensitive: self.opts.match_opts.case_sensitive,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        };
+        let name_opts = MatchOptions { require_literal_separator: false, ..path_opts };
+        let path_str = match path.to_str() {
+            Some(s) => s,
+            None => return false,
+        };
+        let dir_form = if is_dir { Some(format!("{}/", path_str)) } else { None };
+        self.opts.exclude.iter().any(|pat| {
+            if pat.as_str().contains('/') {
+                pat.matches_with(path_str, path_opts)
+                    || dir_form.as_deref().is_some_and(|d| pat.matches_with(d, path_opts))
+            } else {
+                pat.matches_with(name, name_opts)
+            }
+        })
+    }
+}
+
+/// Join a child name onto a directory, keeping walks from "." free of a
+/// `./` prefix.
+fn join(dir: &Path, name: &str) -> PathBuf {
+    if dir == Path::new(".") {
+        PathBuf::from(name)
+    } else {
+        dir.join(name)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn comps(c: &Compiled) -> Vec<&str> {
+        c.comps.iter().map(|p| p.as_str()).collect()
+    }
+
     #[test]
     fn split_relative() {
-        let (root, components) = split_pattern("src/**/*.rs").unwrap();
+        let (root, c) = compile("src/**/*.rs").unwrap();
         assert_eq!(root, PathBuf::new());
-        assert_eq!(components.len(), 3);
-        assert_eq!(components[0].as_str(), "src");
-        assert_eq!(components[1].as_str(), "**");
-        assert_eq!(components[2].as_str(), "*.rs");
+        assert_eq!(comps(&c), vec!["src", "**", "*.rs"]);
+        assert_eq!(c.prefix_len, 1);
+        assert!(!c.require_dir);
     }
 
     #[test]
     fn split_absolute() {
-        let (root, components) = split_pattern("/usr/lib/*.so").unwrap();
+        let (root, c) = compile("/usr/lib/*.so").unwrap();
         assert_eq!(root, PathBuf::from("/"));
-        assert_eq!(components.len(), 3);
+        assert_eq!(c.comps.len(), 3);
+        assert_eq!(c.prefix_len, 2);
     }
 
     #[test]
-    fn split_single_star() {
-        let (root, components) = split_pattern("*").unwrap();
-        assert_eq!(root, PathBuf::new());
-        assert_eq!(components.len(), 1);
+    fn split_drops_dot_components() {
+        let (_, c) = compile("./src/./*.rs").unwrap();
+        assert_eq!(comps(&c), vec!["src", "*.rs"]);
     }
 
     #[test]
-    fn gitignore_parse() {
-        let rules = IgnoreRules {
-            rules: vec![
-                IgnoreRule {
-                    pattern: Pattern::new("**/target").unwrap(),
-                    negated: false,
-                },
-                IgnoreRule {
-                    pattern: Pattern::new("**/*.o").unwrap(),
-                    negated: false,
-                },
-            ],
-        };
-        assert!(is_gitignored(&[rules.clone()], "target"));
-        assert!(is_gitignored(&[rules.clone()], "src/target"));
-        assert!(is_gitignored(&[rules.clone()], "foo.o"));
-        assert!(!is_gitignored(&[rules], "src/main.rs"));
+    fn split_collapses_recursive() {
+        let (_, c) = compile("a/**/**/b").unwrap();
+        assert_eq!(comps(&c), vec!["a", "**", "b"]);
+    }
+
+    #[test]
+    fn split_trailing_slash_requires_dir() {
+        let (_, c) = compile("src/*/").unwrap();
+        assert!(c.require_dir);
     }
 }

@@ -333,6 +333,19 @@ impl Entry {
         }
     }
 
+    /// A directory the walker passes through without yielding: no stat.
+    pub(crate) fn bare_dir(path: PathBuf, is_symlink: bool) -> Self {
+        Entry {
+            path,
+            size: 0,
+            tokens_est: 0,
+            is_dir: true,
+            is_symlink,
+            modified: None,
+            kind: FileKind::Unknown,
+        }
+    }
+
     /// Build an Entry from a path with minimal stat — just enough to know if it's a dir.
     pub(crate) fn from_path_lightweight(path: PathBuf) -> Self {
         let is_dir = fs::metadata(&path).map_or(false, |m| m.is_dir());

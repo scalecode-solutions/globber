@@ -3,8 +3,43 @@
 // --git-changed [ref] yields only files modified since a git ref.
 // Uses `git diff --name-only` under the hood.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// A set of changed files for fast membership tests against walk paths.
+///
+/// Lookups first check the file name (no syscall), and only canonicalize
+/// the candidate path when the name matches a changed file.
+#[derive(Debug, Clone, Default)]
+pub struct ChangedSet {
+    names: HashSet<OsString>,
+    paths: HashSet<PathBuf>,
+}
+
+impl ChangedSet {
+    pub fn new(changed: &[PathBuf]) -> Self {
+        let mut set = ChangedSet::default();
+        for p in changed {
+            if let Some(name) = p.file_name() {
+                set.names.insert(name.to_os_string());
+            }
+            set.paths.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
+        }
+        set
+    }
+
+    /// Whether `path` (relative to the cwd, or absolute) is a changed file.
+    pub fn contains(&self, path: &Path) -> bool {
+        match path.file_name() {
+            Some(name) if self.names.contains(name) => std::fs::canonicalize(path)
+                .map(|c| self.paths.contains(&c))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+}
 
 /// Get the list of files changed since `ref_name` in the repo at `root`.
 ///

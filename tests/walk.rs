@@ -106,7 +106,7 @@ fn question_mark() {
 fn budget_limit() {
     let dir = setup();
     let opts = WalkOptions {
-        limit: 2,
+        limit: Some(2),
         ..WalkOptions::default()
     };
     let paths = glob_abs_opts(dir.path(), "**/*.rs", opts);
