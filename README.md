@@ -13,11 +13,11 @@ A ground-up Rust rewrite of Unix glob, rooted in the POSIX `glob(3)` and `fnmatc
 | Format | Rust iterator | SIF v1 document or plain paths |
 | Patterns | Single | Many patterns and brace alternatives in **one** walk, deduplicated |
 | Negation | None | `--exclude`, `--gitignore` (full gitignore semantics), `Ruleset::exclude()` |
-| Budget | None | `--token-budget`, `--byte-budget`, `--limit`, `--fit` packing |
+| Budget | None | `--token-budget`, `--byte-budget`, `--limit`, `--fit` packing that reports what it left out |
 | Classification | None | `FileKind` (source, test, config, build, doc, data, generated, binary) |
 | Parallelism | None | rayon — parallel readdir + stat, identical output to the sequential walk |
 | Preview | None | `--preview code:15` — skip the preamble, show code |
-| Git | None | `--git-changed main` — only what this branch changed |
+| Git | None | `--git-changed main` (only what this branch changed), `--git-files` (exactly git's view) |
 
 ## Install
 
@@ -42,7 +42,15 @@ globber '**/*.rs' -G main -P code:10
 
 # Plain paths, gitignore-aware, skipping generated code
 globber '**' -g -k source -e '**/generated/**' -p
+
+# Exactly the files git sees (tracked + untracked-not-ignored, submodules included)
+globber '**/*.rs' --git-files -p
 ```
+
+With `--fit`, files that don't fit leave holes in the sorted listing, so
+globber always names them: a `§skipped` section (largest first), a stderr
+note with `-p`, and `budget_skipped_*` lines in `-S`. A walk cut short by
+`-n` or a stop-mode budget reports `stopped_early` in `-S`.
 
 Limits never take `0`: `-n`, `-t`, `--byte-budget` and `--depth` require a
 positive value, or `unlimited` to remove a cap explicitly. See
