@@ -35,6 +35,170 @@ pub enum BudgetMode {
     Fit,
 }
 
+/// The order in which matches are considered for limits and budgets, and
+/// in which they are returned.
+///
+/// Anything other than `Path` needs every match before the first can be
+/// chosen, so the walk runs to completion before limits and budgets apply.
+#[derive(Debug, Clone, Default)]
+pub enum Prefer {
+    /// Path order (default). Allows early termination.
+    #[default]
+    Path,
+    /// Largest files first.
+    Size,
+    /// Smallest files first.
+    SizeAsc,
+    /// Most recently modified first (by mtime).
+    Recent,
+    /// Highest score from an outside ranking first; unscored entries last.
+    Scores(ScoreMap),
+}
+
+impl Prefer {
+    /// The name used on the command line and in §summary.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Prefer::Path => "path",
+            Prefer::Size => "size",
+            Prefer::SizeAsc => "size-asc",
+            Prefer::Recent => "recent",
+            Prefer::Scores(_) => "scores",
+        }
+    }
+
+    /// The score shown for `entry` in `Scores` mode.
+    pub fn score(&self, entry: &Entry) -> Option<f64> {
+        match self {
+            Prefer::Scores(map) => map.get(&entry.path),
+            _ => None,
+        }
+    }
+
+    fn compare(&self, a: &Entry, b: &Entry) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        // `None` sorts last in every mode.
+        fn desc<T: PartialOrd>(a: Option<T>, b: Option<T>) -> Ordering {
+            match (a, b) {
+                (Some(x), Some(y)) => y.partial_cmp(&x).unwrap_or(Ordering::Equal),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        }
+        let primary = match self {
+            Prefer::Path => Ordering::Equal,
+            Prefer::Size => b.size.cmp(&a.size),
+            Prefer::SizeAsc => a.size.cmp(&b.size),
+            Prefer::Recent => desc(a.modified, b.modified),
+            Prefer::Scores(map) => desc(map.get(&a.path), map.get(&b.path)),
+        };
+        primary.then_with(|| a.path.cmp(&b.path))
+    }
+}
+
+/// Scores from an outside ranking, keyed by path (`--prefer-from`).
+#[derive(Clone, Default)]
+pub struct ScoreMap {
+    scores: Arc<std::collections::HashMap<PathBuf, f64>>,
+    has_absolute: bool,
+}
+
+impl ScoreMap {
+    /// Build from (path, score) pairs. Relative paths match both as given
+    /// and relative to `base` (the walk root) when given. If a path repeats, the highest
+    /// score wins.
+    pub fn new<I: IntoIterator<Item = (PathBuf, f64)>>(pairs: I, base: Option<&Path>) -> Self {
+        let mut scores = std::collections::HashMap::new();
+        let mut has_absolute = false;
+        for (path, score) in pairs {
+            let path = path.strip_prefix("./").map(Path::to_path_buf).unwrap_or(path);
+            let keys = if path.is_absolute() {
+                has_absolute = true;
+                vec![fs::canonicalize(&path).unwrap_or(path)]
+            } else {
+                // Accept paths relative to the root or already spelled
+                // the way the walk spells them.
+                match base {
+                    Some(b) => vec![b.join(&path), path],
+                    None => vec![path],
+                }
+            };
+            for key in keys {
+                let slot = scores.entry(key).or_insert(score);
+                if score > *slot {
+                    *slot = score;
+                }
+            }
+        }
+        ScoreMap { scores: Arc::new(scores), has_absolute }
+    }
+
+    /// Parse a ranking: one entry per line, as JSON Lines
+    /// (`{"path": "...", "score": 12}`), `path<TAB>score`, or
+    /// `score path` (the output of `uniq -c`). Blank lines and lines
+    /// starting with `#` are skipped.
+    pub fn parse(text: &str, base: Option<&Path>) -> Result<Self, String> {
+        let mut pairs = Vec::new();
+        for (n, line) in text.lines().enumerate() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            let pair = parse_score_line(t)
+                .ok_or_else(|| format!("line {}: expected JSON, `path<TAB>score` or `score path`: {:?}", n + 1, line))?;
+            pairs.push(pair);
+        }
+        Ok(ScoreMap::new(pairs, base))
+    }
+
+    /// The score for a path as the walk spells it.
+    pub fn get(&self, path: &Path) -> Option<f64> {
+        if let Some(s) = self.scores.get(path) {
+            return Some(*s);
+        }
+        if self.has_absolute {
+            let canon = fs::canonicalize(path).ok()?;
+            return self.scores.get(&canon).copied();
+        }
+        None
+    }
+
+    pub fn len(&self) -> usize {
+        self.scores.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.scores.is_empty()
+    }
+}
+
+impl fmt::Debug for ScoreMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ScoreMap({} paths)", self.scores.len())
+    }
+}
+
+fn parse_score_line(t: &str) -> Option<(PathBuf, f64)> {
+    if t.starts_with('{') {
+        let fields = crate::json::parse_flat_object(t)?;
+        let path = fields.iter().find(|(k, _)| k == "path")?.1.as_str()?;
+        let score = fields.iter().find(|(k, _)| k == "score")?.1.as_f64()?;
+        return Some((PathBuf::from(path), score));
+    }
+    if let Some((a, b)) = t.split_once('\t') {
+        let (a, b) = (a.trim(), b.trim());
+        return match (b.parse::<f64>(), a.parse::<f64>()) {
+            (Ok(score), _) => Some((PathBuf::from(a), score)),
+            (Err(_), Ok(score)) => Some((PathBuf::from(b), score)),
+            _ => None,
+        };
+    }
+    let (first, rest) = t.split_once(char::is_whitespace)?;
+    let score = first.parse::<f64>().ok()?;
+    Some((PathBuf::from(rest.trim_start()), score))
+}
+
 /// A predicate applied to every matched entry before limits and budgets
 /// are charged, so filtered-out entries never consume them.
 #[derive(Clone)]
@@ -73,6 +237,8 @@ pub struct WalkOptions {
     pub token_budget: Option<u64>,
     /// Behavior when an entry would overrun a budget.
     pub budget_mode: BudgetMode,
+    /// Which matches limits and budgets go to first, and output order.
+    pub prefer: Prefer,
     /// If true, only yield directories.
     pub only_dirs: bool,
     /// Maximum depth, counted from the first wildcard component: for
@@ -119,6 +285,7 @@ impl Default for WalkOptions {
             byte_budget: None,
             token_budget: None,
             budget_mode: BudgetMode::Stop,
+            prefer: Prefer::Path,
             only_dirs: false,
             max_depth: None,
             no_stat: false,
@@ -199,6 +366,9 @@ pub fn walk_many_report<S: AsRef<str>>(
     patterns: &[S],
     opts: WalkOptions,
 ) -> Result<WalkReport, GlobError> {
+    if !matches!(opts.prefer, Prefer::Path) {
+        return walk_ranked(patterns, opts);
+    }
     // Expand braces, compile, and group patterns by their root ("", "/", ...).
     let mut groups: Vec<(PathBuf, Vec<Compiled>)> = Vec::new();
     for p in patterns {
@@ -243,6 +413,46 @@ pub fn walk_many_report<S: AsRef<str>>(
             return Err(results.swap_remove(pos).unwrap_err());
         }
     }
+    Ok(WalkReport {
+        results,
+        budget_skipped: sink.budget_skipped,
+        stopped_early: sink.stopped_early,
+    })
+}
+
+/// Walk without limits, rank every match, then apply limits and budgets
+/// in preference order.
+fn walk_ranked<S: AsRef<str>>(patterns: &[S], opts: WalkOptions) -> Result<WalkReport, GlobError> {
+    let unbounded = WalkOptions {
+        limit: None,
+        byte_budget: None,
+        token_budget: None,
+        prefer: Prefer::Path,
+        ..opts.clone()
+    };
+    let all = walk_many_report(patterns, unbounded)?;
+    let (mut entries, errors): (Vec<Entry>, Vec<GlobError>) = {
+        let mut oks = Vec::new();
+        let mut errs = Vec::new();
+        for r in all.results {
+            match r {
+                Ok(e) => oks.push(e),
+                Err(e) => errs.push(e),
+            }
+        }
+        (oks, errs)
+    };
+    entries.par_sort_by(|a, b| opts.prefer.compare(a, b));
+
+    let mut sink = Sink::new(&opts);
+    for e in entries {
+        if sink.stopped {
+            break;
+        }
+        sink.push_entry(e);
+    }
+    let mut results = sink.results;
+    results.extend(errors.into_iter().map(Err));
     Ok(WalkReport {
         results,
         budget_skipped: sink.budget_skipped,

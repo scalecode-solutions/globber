@@ -13,7 +13,7 @@
 use std::fmt::Write;
 
 use crate::entry::Entry;
-use crate::walker::{BudgetMode, StopReason};
+use crate::walker::{BudgetMode, Prefer, StopReason};
 
 /// The `kind` column type: every [`FileKind`](crate::FileKind) name.
 const KIND_ENUM: &str = "enum(source,test,config,build,doc,data,generated,binary,unknown)";
@@ -26,6 +26,10 @@ pub struct SifOptions {
     pub no_stat: bool,
     /// Append a §summary section with these budget figures.
     pub summary: Option<BudgetInfo>,
+    /// The order the entries are in, if known: emits `#sort`, a `prefer`
+    /// summary line, and for `Recent` / `Scores` a `modified` / `score`
+    /// column. `None` = unsorted (no `#sort`).
+    pub order: Option<Prefer>,
     /// Matches left out by a `--fit` budget. When non-empty, a §skipped
     /// section lists the largest of them (see [`MAX_SKIPPED_LISTED`]).
     pub budget_skipped: Vec<Entry>,
@@ -89,32 +93,55 @@ pub fn write_sif_with(entries: &[Entry], opts: &SifOptions, w: &mut dyn Write) -
     writeln!(w, "#!sif v1")?;
     writeln!(w, "#context File listing produced by globber")?;
 
-    if opts.no_stat {
-        writeln!(w, "#schema path:str:path kind:{} is_dir:bool", KIND_ENUM)?;
-        for e in entries {
-            writeln!(w, "{}\t{}\t{}", sif_str(&e.path.to_string_lossy()), e.kind, e.is_dir)?;
+    // Extra column for preference orders that aren't already a column.
+    let extra = match &opts.order {
+        Some(Prefer::Recent) => Some(" modified:datetime?"),
+        Some(Prefer::Scores(_)) => Some(" score:float?"),
+        _ => None,
+    };
+    let extra_value = |e: &Entry| -> String {
+        match &opts.order {
+            Some(Prefer::Recent) => e.modified.map(format_datetime).unwrap_or_else(|| "_".into()),
+            Some(p @ Prefer::Scores(_)) => p.score(e).map(format_float).unwrap_or_else(|| "_".into()),
+            _ => String::new(),
         }
+    };
+
+    if opts.no_stat {
+        writeln!(w, "#schema path:str:path kind:{} is_dir:bool{}", KIND_ENUM, extra.unwrap_or(""))?;
     } else {
         writeln!(
             w,
-            "#schema path:str:path size:uint kind:{} tokens_est:uint is_dir:bool",
-            KIND_ENUM
+            "#schema path:str:path size:uint kind:{} tokens_est:uint is_dir:bool{}",
+            KIND_ENUM,
+            extra.unwrap_or("")
         )?;
-        for e in entries {
-            writeln!(
-                w,
-                "{}\t{}\t{}\t{}\t{}",
-                sif_str(&e.path.to_string_lossy()),
-                e.size,
-                e.kind,
-                e.tokens_est,
-                e.is_dir,
-            )?;
+    }
+    if let Some(order) = &opts.order {
+        let sort = match order {
+            Prefer::Path => "path",
+            Prefer::Size => "size desc",
+            Prefer::SizeAsc => "size asc",
+            Prefer::Recent => "modified desc",
+            Prefer::Scores(_) => "score desc",
+        };
+        writeln!(w, "#sort {}", sort)?;
+    }
+    for e in entries {
+        let path = sif_str(&e.path.to_string_lossy());
+        if opts.no_stat {
+            write!(w, "{}\t{}\t{}", path, e.kind, e.is_dir)?;
+        } else {
+            write!(w, "{}\t{}\t{}\t{}\t{}", path, e.size, e.kind, e.tokens_est, e.is_dir)?;
         }
+        if extra.is_some() {
+            write!(w, "\t{}", extra_value(e))?;
+        }
+        writeln!(w)?;
     }
 
     if let Some(budget) = &opts.summary {
-        write_summary(entries, budget, &opts.budget_skipped, opts.no_stat, w)?;
+        write_summary(entries, budget, &opts.budget_skipped, opts.order.as_ref(), opts.no_stat, w)?;
     }
     if !opts.budget_skipped.is_empty() {
         write_skipped(&opts.budget_skipped, opts.no_stat, w)?;
@@ -161,6 +188,7 @@ fn write_summary(
     entries: &[Entry],
     budget: &BudgetInfo,
     skipped: &[Entry],
+    order: Option<&Prefer>,
     no_stat: bool,
     w: &mut dyn Write,
 ) -> std::fmt::Result {
@@ -190,6 +218,9 @@ fn write_summary(
     if let Some(b) = budget.byte_budget {
         writeln!(w, "byte_budget\t{}", b)?;
         writeln!(w, "byte_budget_remaining\t{}", b.saturating_sub(total_bytes))?;
+    }
+    if let Some(p) = order.filter(|p| !matches!(p, Prefer::Path)) {
+        writeln!(w, "prefer\t{}", p.as_str())?;
     }
     let has_budget = budget.token_budget.is_some() || budget.byte_budget.is_some();
     if has_budget && budget.budget_mode == BudgetMode::Fit {
@@ -223,6 +254,38 @@ pub fn to_paths(entries: &[Entry]) -> String {
         writeln!(buf, "{}", entry.path.display()).unwrap();
     }
     buf
+}
+
+/// ISO 8601 UTC, `YYYY-MM-DDTHH:MM:SSZ` (SIF datetime).
+pub(crate) fn format_datetime(t: std::time::SystemTime) -> String {
+    let secs = match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year,
+        month,
+        day,
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+fn format_float(f: f64) -> String {
+    if f.fract() == 0.0 && f.abs() < 1e15 { format!("{}", f as i64) } else { format!("{}", f) }
 }
 
 // ── Value quoting (SIF Core §10–11) ──────────────────────────────────
@@ -354,6 +417,20 @@ mod tests {
     fn plain_paths() {
         let out = to_paths(&sample_entries());
         assert_eq!(out, "src/main.rs\nCargo.toml\n");
+    }
+
+    #[test]
+    fn datetimes() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(format_datetime(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            format_datetime(UNIX_EPOCH + Duration::from_secs(1_790_000_000)),
+            "2026-09-21T14:13:20Z"
+        );
+        assert_eq!(
+            format_datetime(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "2000-02-29T00:00:00Z"
+        );
     }
 
     #[test]

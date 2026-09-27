@@ -93,8 +93,9 @@ fn sif_document_shape() {
     assert_eq!(l[0], "#!sif v1");
     assert!(l[2].starts_with("#schema path:str:path size:uint kind:enum("));
     assert!(!l[2].contains('\t'), "schema must be space-separated");
-    assert!(l[3].starts_with("Cargo.toml\t"));
-    assert_eq!(l[3].split('\t').count(), 5);
+    assert_eq!(l[3], "#sort path");
+    assert!(l[4].starts_with("Cargo.toml\t"));
+    assert_eq!(l[4].split('\t').count(), 5);
 }
 
 #[test]
@@ -549,4 +550,108 @@ fn stop_and_limit_report_stopped_early() {
     assert!(out.contains("stopped_early\tlimit\n"));
     let out = stdout(&globber(dir.path(), &["Sources/*.swift", "-S"]));
     assert!(!out.contains("stopped_early"));
+}
+
+// ── --prefer / --prefer-from ────────────────────────────────────────
+
+fn set_mtime(path: &Path, secs_ago: u64) {
+    let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+    fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
+}
+
+#[test]
+fn prefer_size_gives_budget_to_big_files() {
+    let dir = fit_tree();
+    // Alphabetical --fit keeps the small files; --prefer size keeps the big one first.
+    let out = globber(dir.path(), &["Sources/*.swift", "-t", "22K", "--fit", "--prefer", "size", "-p"]);
+    assert_eq!(lines(&out), vec!["Sources/Conversation.swift", "Sources/App.swift", "Sources/Message.swift"]);
+    let out = stdout(&globber(dir.path(), &["Sources/*.swift", "--prefer", "size", "-S"]));
+    assert!(out.contains("#sort size desc\n"));
+    assert!(out.contains("prefer\tsize\n"));
+    let out = globber(dir.path(), &["Sources/*.swift", "--prefer", "size-asc", "-n", "1", "-p"]);
+    assert_eq!(lines(&out), vec!["Sources/App.swift"]); // tie with Message.swift breaks by path
+}
+
+#[test]
+fn prefer_recent_orders_by_mtime() {
+    let dir = fit_tree();
+    let d = dir.path();
+    set_mtime(&d.join("Sources/App.swift"), 3000);
+    set_mtime(&d.join("Sources/Conversation.swift"), 2000);
+    set_mtime(&d.join("Sources/Message.swift"), 10);
+    set_mtime(&d.join("Sources/Zebra.swift"), 1000);
+    let out = globber(d, &["Sources/*.swift", "--prefer", "recent", "-n", "2", "-p"]);
+    assert_eq!(lines(&out), vec!["Sources/Message.swift", "Sources/Zebra.swift"]);
+    let out = stdout(&globber(d, &["Sources/*.swift", "--prefer", "recent"]));
+    assert!(out.contains(" modified:datetime?\n#sort modified desc\n"), "{}", out);
+    let rec = out.lines().find(|l| l.starts_with("Sources/Message.swift")).unwrap();
+    let stamp = rec.split('\t').next_back().unwrap();
+    assert_eq!(stamp.len(), 20);
+    assert!(stamp.ends_with('Z') && stamp.contains('T'));
+}
+
+fn run_with_stdin(dir: &Path, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_globber"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn prefer_from_all_three_formats() {
+    let dir = fit_tree();
+    let d = dir.path();
+    let inputs = [
+        "{\"path\": \"Sources/Zebra.swift\", \"score\": 9}\n{\"path\": \"./Sources/App.swift\", \"score\": 3.5}\n",
+        "Sources/Zebra.swift\t9\nSources/App.swift\t3.5\n",
+        "      9 Sources/Zebra.swift\n    3.5 Sources/App.swift\n# comment\n\n",
+    ];
+    for input in inputs {
+        let out = run_with_stdin(d, &["Sources/*.swift", "--prefer-from", "-", "-p"], input);
+        assert!(out.status.success(), "{}", stderr(&out));
+        // Scored first (highest first), then unscored by path.
+        assert_eq!(
+            lines(&out),
+            vec!["Sources/Zebra.swift", "Sources/App.swift", "Sources/Conversation.swift", "Sources/Message.swift"],
+            "input {:?}",
+            input
+        );
+    }
+    let out = stdout(&run_with_stdin(d, &["Sources/*.swift", "--prefer-from", "-"], inputs[1]));
+    assert!(out.contains(" score:float?\n#sort score desc\n"));
+    assert!(out.contains("Sources/Zebra.swift\t35000\tsource\t10000\tfalse\t9\n"));
+    assert!(out.contains("Sources/Message.swift\t3500\tsource\t1000\tfalse\t_\n"));
+}
+
+#[test]
+fn prefer_from_file_and_root_relative_paths() {
+    let dir = fit_tree();
+    let d = dir.path();
+    let rank = d.join("rank.tsv");
+    fs::write(&rank, "Message.swift\t5\n").unwrap();
+    let out = globber(d, &["*.swift", "-r", "Sources", "--prefer-from", rank.to_str().unwrap(), "-n", "1", "-p"]);
+    assert_eq!(lines(&out), vec!["Sources/Message.swift"]);
+}
+
+#[test]
+fn prefer_usage_errors() {
+    let dir = fit_tree();
+    let d = dir.path();
+    for args in [
+        &["**", "--prefer", "churn"][..],
+        &["**", "--prefer", "size", "--prefer-from", "x"],
+        &["**", "--prefer", "recent", "--no-stat"],
+    ] {
+        assert_eq!(globber(d, args).status.code(), Some(2), "{:?}", args);
+    }
+    let out = run_with_stdin(d, &["**", "--prefer-from", "-"], "not a valid line\n");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("line 1"));
 }

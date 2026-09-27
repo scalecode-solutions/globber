@@ -9,7 +9,7 @@ use std::env;
 use std::process;
 
 use globber::{
-    to_paths, to_sif_with, BudgetInfo, BudgetMode, Entry, EntryFilter, FileKind, MatchOptions, PreviewMode,
+    to_paths, to_sif_with, BudgetInfo, BudgetMode, Prefer, Entry, EntryFilter, FileKind, MatchOptions, PreviewMode,
     SifOptions, WalkOptions,
 };
 
@@ -18,7 +18,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // ── Argument parsing ─────────────────────────────────────────────────
 
 enum Command {
-    Glob(GlobArgs),
+    Glob(Box<GlobArgs>),
     Match(MatchArgs),
     Expand(String),
     Help(HelpTopic),
@@ -52,6 +52,8 @@ struct GlobArgs {
     fit: bool,
     skip_nested_repos: bool,
     git_files: bool,
+    prefer: Option<String>,
+    prefer_from: Option<String>,
     preview: Option<PreviewMode>,
     git_changed: Option<String>,
 }
@@ -167,6 +169,8 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
         fit: false,
         skip_nested_repos: false,
         git_files: false,
+        prefer: None,
+        prefer_from: None,
         preview: None,
         git_changed: None,
     };
@@ -190,6 +194,17 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
             "--fit" => ga.fit = true,
             "--skip-nested-repos" => ga.skip_nested_repos = true,
             "--git-files" => ga.git_files = true,
+            "--prefer" => {
+                let val = args.value(&flag, "an order (path, size, size-asc, recent)")?;
+                if !matches!(val.as_str(), "path" | "size" | "size-asc" | "recent") {
+                    return Err(format!(
+                        "unknown --prefer order: {:?} (try: path, size, size-asc, recent; or --prefer-from FILE)",
+                        val
+                    ));
+                }
+                ga.prefer = Some(val);
+            }
+            "--prefer-from" => ga.prefer_from = Some(args.value(&flag, "a file or -")?),
             "--dirs" | "-d" => ga.only_dirs = true,
             "--preview" | "-P" => {
                 let val = args.value(&flag, "a spec (N, N-M, or code:N)")?;
@@ -237,10 +252,16 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
     if ga.patterns.is_empty() {
         return Err("no patterns given".to_string());
     }
+    if ga.prefer.is_some() && ga.prefer_from.is_some() {
+        return Err("use either --prefer or --prefer-from, not both".to_string());
+    }
+    if ga.no_stat && matches!(ga.prefer.as_deref(), Some("size" | "size-asc" | "recent")) {
+        return Err("--prefer size/recent needs file metadata; drop --no-stat".to_string());
+    }
     if ga.git_files && ga.only_dirs {
         return Err("--git-files lists files only; it can't be combined with --dirs".to_string());
     }
-    Ok(Command::Glob(ga))
+    Ok(Command::Glob(Box::new(ga)))
 }
 
 fn parse_match_args(mut args: ArgStream) -> Result<Command, String> {
@@ -421,6 +442,26 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
         }))
     };
 
+    let prefer = match (&ga.prefer, &ga.prefer_from) {
+        (_, Some(src)) => {
+            let text = if src == "-" {
+                std::io::read_to_string(std::io::stdin()).map_err(|e| format!("reading stdin: {}", e))?
+            } else {
+                std::fs::read_to_string(src).map_err(|e| format!("reading {}: {}", src, e))?
+            };
+            let map = globber::ScoreMap::parse(&text, root.map(std::path::Path::new))
+                .map_err(|e| format!("--prefer-from {}: {}", src, e))?;
+            Prefer::Scores(map)
+        }
+        (Some(p), None) => match p.as_str() {
+            "size" => Prefer::Size,
+            "size-asc" => Prefer::SizeAsc,
+            "recent" => Prefer::Recent,
+            _ => Prefer::Path,
+        },
+        (None, None) => Prefer::Path,
+    };
+
     let opts = WalkOptions {
         match_opts: MatchOptions {
             require_literal_leading_dot: !ga.hidden,
@@ -437,6 +478,7 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
         follow_symlinks: ga.follow,
         skip_nested_repos: ga.skip_nested_repos,
         git_files: ga.git_files,
+        prefer: prefer.clone(),
         budget_mode: if ga.fit { BudgetMode::Fit } else { BudgetMode::Stop },
         exclude,
         filter,
@@ -483,9 +525,14 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
                 budget_mode: if ga.fit { BudgetMode::Fit } else { BudgetMode::Stop },
                 stopped_early: report.stopped_early,
             });
+            let order = match prefer {
+                Prefer::Path if !ga.sorted => None,
+                p => Some(p),
+            };
             let sif_opts = SifOptions {
                 no_stat: ga.no_stat,
                 summary,
+                order,
                 budget_skipped: report.budget_skipped,
             };
             let mut out = to_sif_with(&entries, &sif_opts);
@@ -727,6 +774,24 @@ OPTIONS
   --byte-budget <N | unlimited>
       Like --token-budget, for total file bytes.
 
+  --prefer <ORDER>
+      Which matches -n and budgets go to first, and the output order:
+        path       Path order (default). The walk can stop early.
+        size       Largest files first; size-asc for smallest first.
+        recent     Most recently modified first (adds a modified column).
+      Ties break by path. Any order but path ranks every match first, so
+      the whole tree is walked. With -t 60K --fit --prefer size, the
+      biggest files get the budget and smaller ones fill the gaps.
+
+  --prefer-from <FILE | ->
+      Order by scores from another tool (highest first; unscored files
+      last) and add a score column. One entry per line, as JSON Lines
+      {\"path\": \"src/a.rs\", \"score\": 12}, path<TAB>score, or `score path`
+      (uniq -c output). Relative paths are relative to the root. For
+      example, prefer the files changed most often in the last 90 days:
+        git log --since=90.days --name-only --format= | sort | uniq -c \\
+          | globber 'src/**' -t 60K --fit --prefer-from -
+
   --fit
       With a budget: instead of stopping at the first result that doesn't
       fit, skip it and keep going, packing as many results as fit (in
@@ -854,7 +919,7 @@ fn main() {
             println!("globber {}", VERSION);
             Ok(())
         }
-        Command::Glob(ga) => cmd_glob(ga),
+        Command::Glob(ga) => cmd_glob(*ga),
         Command::Match(ma) => cmd_match(ma),
         Command::Expand(pat) => cmd_expand(&pat),
     };
