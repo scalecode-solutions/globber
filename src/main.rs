@@ -17,6 +17,9 @@ use globber::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Default cap on SIF output, in estimated tokens.
+const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 25_000;
+
 // ── Argument parsing ─────────────────────────────────────────────────
 
 enum Command {
@@ -56,6 +59,9 @@ struct GlobArgs {
     git_files: bool,
     prefer: Option<String>,
     prefer_from: Option<String>,
+    /// None = flag not given (format default applies); Some(None) = unlimited.
+    max_output_tokens: Option<Option<u64>>,
+    skipped_rows: Option<usize>,
     preview: Option<PreviewMode>,
     git_changed: Option<String>,
 }
@@ -173,6 +179,8 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
         git_files: false,
         prefer: None,
         prefer_from: None,
+        max_output_tokens: None,
+        skipped_rows: Some(globber::sif_output::DEFAULT_SKIPPED_ROWS),
         preview: None,
         git_changed: None,
     };
@@ -207,6 +215,16 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
                 ga.prefer = Some(val);
             }
             "--prefer-from" => ga.prefer_from = Some(args.value(&flag, "a file or -")?),
+            "--max-output-tokens" => {
+                ga.max_output_tokens = Some(parse_budget(&flag, &args.value(&flag, "a size")?)?);
+            }
+            "--skipped" => {
+                let val = args.value(&flag, "a number, `none` or `unlimited`")?;
+                ga.skipped_rows = match val.as_str() {
+                    "none" => Some(0),
+                    _ => parse_count(&flag, &val).map_err(|e| format!("{} (or `none` to list no rows)", e))?,
+                };
+            }
             "--dirs" | "-d" => ga.only_dirs = true,
             "--preview" | "-P" => {
                 let val = args.value(&flag, "a spec (N, N-M, or code:N)")?;
@@ -234,7 +252,7 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
             "--byte-budget" => {
                 ga.byte_budget = parse_budget(&flag, &args.value(&flag, "a size")?)?;
             }
-            "--token-budget" | "-t" => {
+            "--token-budget" | "--content-budget" | "-t" => {
                 ga.token_budget = parse_budget(&flag, &args.value(&flag, "a size")?)?;
             }
             "--kind" | "-k" => {
@@ -527,7 +545,25 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
     }
 
     let output = match ga.format {
-        OutputFormat::Paths => to_paths(&entries),
+        OutputFormat::Paths => {
+            // Paths feed other programs, so they are capped only on request.
+            let mut out = to_paths(&entries);
+            if let Some(Some(cap)) = ga.max_output_tokens {
+                let max_bytes = (cap as usize).saturating_mul(7) / 2;
+                if out.len() > max_bytes {
+                    let cut = out[..max_bytes].rfind('\n').map_or(0, |i| i + 1);
+                    let shown = out[..cut].lines().count();
+                    out.truncate(cut);
+                    eprintln!(
+                        "note: output truncated to {} of {} paths by --max-output-tokens {}; use --max-output-tokens unlimited",
+                        shown,
+                        entries.len(),
+                        cap
+                    );
+                }
+            }
+            out
+        }
         OutputFormat::Sif => {
             let summary = ga.summary.then(|| BudgetInfo {
                 token_budget: ga.token_budget,
@@ -548,13 +584,14 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
                 no_stat: ga.no_stat,
                 summary,
                 order,
+                limit: ga.limit,
+                stopped_early: report.stopped_early,
                 budget_skipped: report.budget_skipped,
+                skipped_rows: ga.skipped_rows,
+                preview: ga.preview.clone(),
+                max_output_tokens: ga.max_output_tokens.unwrap_or(Some(DEFAULT_MAX_OUTPUT_TOKENS)),
             };
-            let mut out = to_sif_with(&entries, &sif_opts);
-            if let Some(ref mode) = ga.preview {
-                globber::write_preview(&entries, mode, &mut out).map_err(|e| e.to_string())?;
-            }
-            out
+            to_sif_with(&entries, &sif_opts)
         }
     };
 
@@ -783,13 +820,24 @@ OPTIONS
       Stop after N results (N >= 1). Results are sorted, so this is the
       first N paths in order; the walk stops as soon as they are found.
 
-  -t, --token-budget <N | unlimited>
-      Stop at the first result that would push the estimated token total
+  -t, --token-budget, --content-budget <N | unlimited>
+      A budget for the matched files' content (not for globber's own
+      output; see --max-output-tokens). Stop at the first result that would push the estimated token total
       over N (N > 0). Accepts suffixes: 80K, 1.5M. Estimates are size/3.5
       (or per-extension medians with --no-stat).
 
   --byte-budget <N | unlimited>
       Like --token-budget, for total file bytes.
+
+  --max-output-tokens <N | unlimited>
+      Cap globber's own output — what reading the result costs. Default
+      25K for SIF output; unlimited for --paths (which feeds other
+      programs) unless set. When the SIF document would exceed it,
+      previews are shortened (same line count per file, down to 3
+      lines), then dropped from the end, then §skipped rows, then records. Each cut section
+      gets a #truncated directive, and -S an output_truncated line; the
+      summary totals still describe every match. With --paths, whole
+      lines are kept and a note goes to stderr.
 
   --prefer <ORDER>
       Which matches -n and budgets go to first, and the output order:
@@ -817,6 +865,10 @@ OPTIONS
       lists the 50 largest (with --paths, a note on stderr), and -S adds
       budget_skipped_files / _tokens_est / _bytes.
 
+  --skipped <N | none | unlimited>
+      How many §skipped rows to list (largest first). Default 50. `none`
+      lists no rows; the summary still counts them.
+
   -k, --kind <KIND,...>
       Only yield files of the given kind(s). Comma-separated: source, test,
       config, build, doc, data, generated, binary, unknown.
@@ -836,7 +888,8 @@ OPTIONS
   --
       Treat every following argument as a pattern.
 
-  -n, -t, --byte-budget and --depth never accept 0; `unlimited` (the
+  -n, -t, --byte-budget, --max-output-tokens, --skipped and --depth never
+  accept 0; `unlimited` (the
   default) explicitly removes a cap, e.g. to override an earlier value.
   Long options also accept --option=value. Kind, git-changed and exclude
   filters are applied before limits and budgets are charged.

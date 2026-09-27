@@ -592,12 +592,12 @@ fn fit_with_nothing_skipped_says_zero() {
 fn stop_and_limit_report_stopped_early() {
     let dir = fit_tree();
     let out = stdout(&globber(dir.path(), &["Sources/*.swift", "-t", "5K", "-S"]));
-    assert!(out.contains("stopped_early\ttoken_budget\n"));
+    assert!(out.contains("stopped_early\ttoken_budget\t"));
     assert!(!out.contains("budget_mode"));
     let out = stdout(&globber(dir.path(), &["Sources/*.swift", "--byte-budget", "5K", "-S"]));
-    assert!(out.contains("stopped_early\tbyte_budget\n"));
+    assert!(out.contains("stopped_early\tbyte_budget\t"));
     let out = stdout(&globber(dir.path(), &["Sources/*.swift", "-n", "1", "-S"]));
-    assert!(out.contains("stopped_early\tlimit\n"));
+    assert!(out.contains("stopped_early\tlimit\t"));
     let out = stdout(&globber(dir.path(), &["Sources/*.swift", "-S"]));
     assert!(!out.contains("stopped_early"));
 }
@@ -704,4 +704,84 @@ fn prefer_usage_errors() {
     let out = run_with_stdin(d, &["**", "--prefer-from", "-"], "not a valid line\n");
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("line 1"));
+}
+
+// ── Output cap ──────────────────────────────────────────────────────
+
+fn big_tree() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..400 {
+        let body: String = (0..40).map(|l| format!("fn f{}_{}() {{}}\n", i, l)).collect();
+        write(dir.path(), &format!("src/m{:03}.rs", i), &body);
+    }
+    dir
+}
+
+fn est_tokens(s: &str) -> u64 {
+    (s.len() as u64 * 2).div_ceil(7)
+}
+
+#[test]
+fn default_cap_shortens_previews_first() {
+    let dir = big_tree();
+    let out = stdout(&globber(dir.path(), &["src/*.rs", "-P", "code:40", "-S"]));
+    assert!(est_tokens(&out) <= 25_000, "{} tokens", est_tokens(&out));
+    // All 400 records survive; previews were shortened, not the listing.
+    assert_eq!(out.lines().filter(|l| l.starts_with("src/m") && l.contains("\tsource\t")).count(), 400);
+    assert!(out.contains("#truncated reason=output_budget lines_per_file="), "{}", &out[..500]);
+    assert!(out.contains("output_truncated\tpreview\t"));
+    assert!(!out.contains("reason=output_budget dropped=") || out.contains("§preview\n#truncated"));
+    // Unlimited restores everything.
+    let full = stdout(&globber(dir.path(), &["src/*.rs", "-P", "code:40", "--max-output-tokens", "unlimited"]));
+    assert!(!full.contains("#truncated"));
+    assert!(est_tokens(&full) > 25_000);
+}
+
+#[test]
+fn tight_cap_drops_previews_then_records() {
+    let dir = big_tree();
+    let out = stdout(&globber(dir.path(), &["src/*.rs", "-P", "5", "-S", "--max-output-tokens", "2K"]));
+    assert!(est_tokens(&out) <= 2_000, "{} tokens", est_tokens(&out));
+    assert!(out.contains("#truncated reason=output_budget dropped="));
+    assert!(out.contains("recover=\"--max-output-tokens unlimited\""));
+    // Summary totals still describe every match.
+    assert!(out.contains("total_files\t400\n"));
+    assert!(out.contains("output_truncated\trecords,preview\t"), "{}", out);
+    let records = out.lines().filter(|l| l.starts_with("src/m")).count();
+    assert!(records > 0 && records < 400);
+}
+
+#[test]
+fn paths_are_uncapped_unless_asked() {
+    let dir = big_tree();
+    let out = globber(dir.path(), &["src/*.rs", "-p"]);
+    assert_eq!(lines(&out).len(), 400);
+    let out = globber(dir.path(), &["src/*.rs", "-p", "--max-output-tokens", "100"]);
+    let l = lines(&out);
+    assert!(!l.is_empty() && l.len() < 400);
+    assert!(l.iter().all(|p| p.ends_with(".rs")), "partial line: {:?}", l.last());
+    assert!(stderr(&out).contains("output truncated to"));
+}
+
+#[test]
+fn limit_and_stop_emit_spec_directives() {
+    let dir = big_tree();
+    let out = stdout(&globber(dir.path(), &["src/*.rs", "-n", "3"]));
+    assert!(out.contains("#limit 3\n#truncated reason=limit\n"), "{}", out);
+    let out = stdout(&globber(dir.path(), &["src/*.rs", "-t", "1K"]));
+    assert!(out.contains("#truncated reason=token_budget\n"));
+}
+
+#[test]
+fn skipped_rows_option() {
+    let dir = fit_tree();
+    let d = dir.path();
+    let out = stdout(&globber(d, &["Sources/*.swift", "-t", "2K", "--fit", "--skipped", "1"]));
+    assert!(out.contains("(1 of 2)\n"));
+    assert!(out.contains("#limit 1\n"));
+    let out = stdout(&globber(d, &["Sources/*.swift", "-t", "2K", "--fit", "--skipped", "none", "-S"]));
+    assert!(!out.contains("§skipped"));
+    assert!(out.contains("budget_skipped_files\t2\n"));
+    assert_eq!(globber(d, &["**", "--skipped", "0"]).status.code(), Some(2));
+    assert_eq!(globber(d, &["**", "--max-output-tokens", "0"]).status.code(), Some(2));
 }

@@ -13,13 +13,14 @@
 use std::fmt::Write;
 
 use crate::entry::Entry;
+use crate::preview::{PreviewBlock, PreviewMode};
 use crate::walker::{BudgetMode, Prefer, PruneCounts, StopReason};
 
 /// The `kind` column type: every [`FileKind`](crate::FileKind) name.
 const KIND_ENUM: &str = "enum(source,test,config,build,doc,data,generated,binary,unknown)";
 
 /// Options for SIF emission.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SifOptions {
     /// Entries came from a `no_stat` walk: omit the size and token columns
     /// (they would be zeros and guesses) and the byte/token totals.
@@ -30,13 +31,45 @@ pub struct SifOptions {
     /// summary line, and for `Recent` / `Scores` a `modified` / `score`
     /// column. `None` = unsorted (no `#sort`).
     pub order: Option<Prefer>,
-    /// Matches left out by a `--fit` budget. When non-empty, a §skipped
-    /// section lists the largest of them (see [`MAX_SKIPPED_LISTED`]).
+    /// The result limit in effect (`-n`), emitted as `#limit`.
+    pub limit: Option<usize>,
+    /// Why the walk stopped early, emitted as `#truncated`.
+    pub stopped_early: Option<StopReason>,
+    /// Matches left out by a `--fit` budget, listed in a §skipped section.
     pub budget_skipped: Vec<Entry>,
+    /// How many §skipped rows to list, largest first. `None` = all;
+    /// `Some(0)` = no section (the summary still counts them).
+    pub skipped_rows: Option<usize>,
+    /// Append a §preview section.
+    pub preview: Option<PreviewMode>,
+    /// Cap on the estimated tokens of the whole document. When the
+    /// document would exceed it, previews are shortened, then dropped,
+    /// then §skipped rows, then records — each marked with `#truncated`.
+    pub max_output_tokens: Option<u64>,
 }
 
-/// How many budget-skipped entries the §skipped section lists.
-pub const MAX_SKIPPED_LISTED: usize = 50;
+impl Default for SifOptions {
+    fn default() -> Self {
+        SifOptions {
+            no_stat: false,
+            summary: None,
+            order: None,
+            limit: None,
+            stopped_early: None,
+            budget_skipped: Vec::new(),
+            skipped_rows: Some(DEFAULT_SKIPPED_ROWS),
+            preview: None,
+            max_output_tokens: None,
+        }
+    }
+}
+
+/// The output cap shortens previews to no fewer lines than this before
+/// dropping whole preview blocks.
+pub const MIN_PREVIEW_LINES: usize = 3;
+
+/// Default number of §skipped rows.
+pub const DEFAULT_SKIPPED_ROWS: usize = 50;
 
 /// Budget and timing figures for the §summary section.
 #[derive(Debug, Clone, Default)]
@@ -82,13 +115,6 @@ pub fn to_sif_with_summary_and_budget(entries: &[Entry], budget: &BudgetInfo) ->
     )
 }
 
-/// Format entries as a SIF document with explicit options.
-pub fn to_sif_with(entries: &[Entry], opts: &SifOptions) -> String {
-    let mut buf = String::with_capacity(entries.len() * 80 + 512);
-    write_sif_with(entries, opts, &mut buf).unwrap();
-    buf
-}
-
 /// Write entries as SIF to any fmt::Write sink.
 pub fn write_sif(entries: &[Entry], w: &mut dyn Write) -> std::fmt::Result {
     write_sif_with(entries, &SifOptions::default(), w)
@@ -96,32 +122,207 @@ pub fn write_sif(entries: &[Entry], w: &mut dyn Write) -> std::fmt::Result {
 
 /// Write entries as SIF with explicit options.
 pub fn write_sif_with(entries: &[Entry], opts: &SifOptions, w: &mut dyn Write) -> std::fmt::Result {
-    writeln!(w, "#!sif v1")?;
-    writeln!(w, "#context File listing produced by globber")?;
+    w.write_str(&to_sif_with(entries, opts))
+}
 
-    // Extra column for preference orders that aren't already a column.
-    let extra = match &opts.order {
-        Some(Prefer::Recent) => Some(" modified:datetime?"),
-        Some(Prefer::Scores(_)) => Some(" score:float?"),
-        _ => None,
-    };
-    let extra_value = |e: &Entry| -> String {
-        match &opts.order {
-            Some(Prefer::Recent) => e.modified.map(format_datetime).unwrap_or_else(|| "_".into()),
-            Some(p @ Prefer::Scores(_)) => p.score(e).map(format_float).unwrap_or_else(|| "_".into()),
-            _ => String::new(),
+/// Estimated tokens for `bytes` of output (the same size/3.5 estimate
+/// used for files).
+fn tokens_for(bytes: usize) -> u64 {
+    (bytes as u64 * 2).div_ceil(7)
+}
+
+/// What the output cap removed.
+#[derive(Debug, Default, Clone, Copy)]
+struct Cuts {
+    records_dropped: usize,
+    skipped_rows_dropped: usize,
+    /// Lines kept per preview block, if previews were shortened.
+    preview_lines: Option<usize>,
+    preview_blocks_dropped: usize,
+}
+
+impl Cuts {
+    fn any(&self) -> bool {
+        self.records_dropped > 0
+            || self.skipped_rows_dropped > 0
+            || self.preview_lines.is_some()
+            || self.preview_blocks_dropped > 0
+    }
+
+    fn sections(&self) -> String {
+        let mut parts = Vec::new();
+        if self.records_dropped > 0 {
+            parts.push("records");
         }
+        if self.skipped_rows_dropped > 0 {
+            parts.push("skipped");
+        }
+        if self.preview_lines.is_some() || self.preview_blocks_dropped > 0 {
+            parts.push("preview");
+        }
+        parts.join(",")
+    }
+}
+
+/// Format entries as a SIF document with explicit options.
+pub fn to_sif_with(entries: &[Entry], opts: &SifOptions) -> String {
+    // Build every section as data, then fit it to the output cap.
+    let records: Vec<String> = entries.iter().map(|e| record_line(e, opts)).collect();
+
+    let mut skipped: Vec<&Entry> = opts.budget_skipped.iter().collect();
+    skipped.sort_by(|a, b| b.tokens_est.cmp(&a.tokens_est).then(a.path.cmp(&b.path)));
+    let listed = opts.skipped_rows.map_or(skipped.len(), |n| n.min(skipped.len()));
+    let skipped_rows: Vec<String> = skipped[..listed].iter().map(|e| skipped_line(e, opts.no_stat)).collect();
+
+    let (blocks, binary_skipped) = match &opts.preview {
+        Some(mode) => {
+            let (b, n) = crate::preview::collect_previews(entries, mode);
+            (Some(b), n)
+        }
+        None => (None, 0),
     };
 
-    if opts.no_stat {
-        writeln!(w, "#schema path:str:path kind:{} is_dir:bool{}", KIND_ENUM, extra.unwrap_or(""))?;
+    let cuts = match opts.max_output_tokens {
+        Some(cap) => fit(cap, entries, opts, &records, &skipped_rows, blocks.as_deref(), binary_skipped, skipped.len()),
+        None => Cuts::default(),
+    };
+
+    render(entries, opts, &records, &skipped_rows, skipped.len(), blocks.as_deref(), binary_skipped, cuts)
+}
+
+/// Decide what to cut so the document fits `cap` tokens.
+#[allow(clippy::too_many_arguments)]
+fn fit(
+    cap: u64,
+    entries: &[Entry],
+    opts: &SifOptions,
+    records: &[String],
+    skipped_rows: &[String],
+    blocks: Option<&[PreviewBlock]>,
+    binary_skipped: usize,
+    skipped_total: usize,
+) -> Cuts {
+    let size = |cuts: Cuts| {
+        render(entries, opts, records, skipped_rows, skipped_total, blocks, binary_skipped, cuts).len()
+    };
+    let fits = |cuts: Cuts| tokens_for(size(cuts)) <= cap;
+
+    let mut cuts = Cuts::default();
+    if fits(cuts) {
+        return cuts;
+    }
+
+    // 1. Shorten every preview to the same number of lines, but not below
+    //    a few lines: a one-line excerpt says almost nothing.
+    if let Some(blocks) = blocks.filter(|b| !b.is_empty()) {
+        let longest = blocks.iter().map(|b| b.lines.len()).max().unwrap_or(1);
+        let floor = MIN_PREVIEW_LINES.min(longest);
+        if fits(Cuts { preview_lines: Some(floor), ..cuts }) {
+            let (mut lo, mut hi) = (floor, longest);
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if fits(Cuts { preview_lines: Some(mid), ..cuts }) { lo = mid } else { hi = mid - 1 }
+            }
+            cuts.preview_lines = Some(lo);
+            return cuts;
+        }
+        // 2. Drop preview blocks from the end, at the floor length.
+        cuts.preview_lines = Some(floor);
+        let (mut lo, mut hi) = (0, blocks.len()); // blocks to drop
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if fits(Cuts { preview_blocks_dropped: mid, ..cuts }) { hi = mid } else { lo = mid + 1 }
+        }
+        cuts.preview_blocks_dropped = lo;
+        if lo < blocks.len() {
+            return cuts;
+        }
+    }
+
+    // 3. Drop §skipped rows (smallest first; the summary keeps the counts).
+    let (mut lo, mut hi) = (0, skipped_rows.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if fits(Cuts { skipped_rows_dropped: mid, ..cuts }) { hi = mid } else { lo = mid + 1 }
+    }
+    cuts.skipped_rows_dropped = lo;
+    if fits(cuts) {
+        return cuts;
+    }
+
+    // 4. Drop records from the end.
+    let (mut lo, mut hi) = (0, records.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if fits(Cuts { records_dropped: mid, ..cuts }) { hi = mid } else { lo = mid + 1 }
+    }
+    cuts.records_dropped = lo;
+    cuts
+}
+
+fn record_line(e: &Entry, opts: &SifOptions) -> String {
+    let path = sif_str(&e.path.to_string_lossy());
+    let mut line = if opts.no_stat {
+        format!("{}\t{}\t{}", path, e.kind, e.is_dir)
     } else {
-        writeln!(
+        format!("{}\t{}\t{}\t{}\t{}", path, e.size, e.kind, e.tokens_est, e.is_dir)
+    };
+    match &opts.order {
+        Some(Prefer::Recent) => {
+            line.push('\t');
+            line.push_str(&e.modified.map(format_datetime).unwrap_or_else(|| "_".into()));
+        }
+        Some(p @ Prefer::Scores(_)) => {
+            line.push('\t');
+            line.push_str(&p.score(e).map(format_float).unwrap_or_else(|| "_".into()));
+        }
+        _ => {}
+    }
+    line.push('\n');
+    line
+}
+
+fn skipped_line(e: &Entry, no_stat: bool) -> String {
+    let path = sif_str(&e.path.to_string_lossy());
+    if no_stat {
+        format!("{}\t{}\n", path, e.kind)
+    } else {
+        format!("{}\t{}\t{}\t{}\n", path, e.size, e.kind, e.tokens_est)
+    }
+}
+
+const RECOVER: &str = "recover=\"--max-output-tokens unlimited\"";
+
+#[allow(clippy::too_many_arguments)]
+fn render(
+    entries: &[Entry],
+    opts: &SifOptions,
+    records: &[String],
+    skipped_rows: &[String],
+    skipped_total: usize,
+    blocks: Option<&[PreviewBlock]>,
+    binary_skipped: usize,
+    cuts: Cuts,
+) -> String {
+    let mut w = String::with_capacity(records.iter().map(String::len).sum::<usize>() + 1024);
+    let budget = opts.max_output_tokens.unwrap_or(0);
+
+    // Main section.
+    let _ = writeln!(w, "#!sif v1");
+    let _ = writeln!(w, "#context File listing produced by globber");
+    let extra = match &opts.order {
+        Some(Prefer::Recent) => " modified:datetime?",
+        Some(Prefer::Scores(_)) => " score:float?",
+        _ => "",
+    };
+    if opts.no_stat {
+        let _ = writeln!(w, "#schema path:str:path kind:{} is_dir:bool{}", KIND_ENUM, extra);
+    } else {
+        let _ = writeln!(
             w,
             "#schema path:str:path size:uint kind:{} tokens_est:uint is_dir:bool{}",
-            KIND_ENUM,
-            extra.unwrap_or("")
-        )?;
+            KIND_ENUM, extra
+        );
     }
     if let Some(order) = &opts.order {
         let sort = match order {
@@ -131,73 +332,89 @@ pub fn write_sif_with(entries: &[Entry], opts: &SifOptions, w: &mut dyn Write) -
             Prefer::Recent => "modified desc",
             Prefer::Scores(_) => "score desc",
         };
-        writeln!(w, "#sort {}", sort)?;
+        let _ = writeln!(w, "#sort {}", sort);
     }
-    for e in entries {
-        let path = sif_str(&e.path.to_string_lossy());
+    if let Some(limit) = opts.limit {
+        let _ = writeln!(w, "#limit {}", limit);
+    }
+    if let Some(reason) = opts.stopped_early {
+        let _ = writeln!(w, "#truncated reason={}", reason.as_str());
+    }
+    if cuts.records_dropped > 0 {
+        let _ = writeln!(
+            w,
+            "#truncated reason=output_budget dropped={} budget={} {}",
+            cuts.records_dropped, budget, RECOVER
+        );
+    }
+    for r in &records[..records.len() - cuts.records_dropped] {
+        w.push_str(r);
+    }
+
+    if let Some(info) = &opts.summary {
+        write_summary(entries, info, &opts.budget_skipped, opts, binary_skipped, cuts, &mut w);
+    }
+
+    let rows_shown = skipped_rows.len() - cuts.skipped_rows_dropped;
+    if skipped_total > 0 && opts.skipped_rows != Some(0) {
+        let _ = writeln!(w, "---");
+        let _ = writeln!(w, "§skipped");
+        let _ = writeln!(
+            w,
+            "#context Matched but left out to fit the budget, largest first ({} of {})",
+            rows_shown, skipped_total
+        );
         if opts.no_stat {
-            write!(w, "{}\t{}\t{}", path, e.kind, e.is_dir)?;
+            let _ = writeln!(w, "#schema path:str:path kind:{}", KIND_ENUM);
         } else {
-            write!(w, "{}\t{}\t{}\t{}\t{}", path, e.size, e.kind, e.tokens_est, e.is_dir)?;
+            let _ = writeln!(w, "#schema path:str:path size:uint kind:{} tokens_est:uint", KIND_ENUM);
         }
-        if extra.is_some() {
-            write!(w, "\t{}", extra_value(e))?;
+        let _ = writeln!(w, "#sort tokens_est desc");
+        if skipped_rows.len() < skipped_total {
+            let _ = writeln!(w, "#limit {}", skipped_rows.len());
         }
-        writeln!(w)?;
-    }
-
-    if let Some(budget) = &opts.summary {
-        write_summary(entries, budget, &opts.budget_skipped, opts.order.as_ref(), opts.no_stat, w)?;
-    }
-    if !opts.budget_skipped.is_empty() {
-        write_skipped(&opts.budget_skipped, opts.no_stat, w)?;
-    }
-    Ok(())
-}
-
-/// The §skipped section: matches a --fit budget left out, largest first.
-fn write_skipped(skipped: &[Entry], no_stat: bool, w: &mut dyn Write) -> std::fmt::Result {
-    let mut by_size: Vec<&Entry> = skipped.iter().collect();
-    by_size.sort_by(|a, b| b.tokens_est.cmp(&a.tokens_est).then(a.path.cmp(&b.path)));
-    let shown = by_size.len().min(MAX_SKIPPED_LISTED);
-
-    writeln!(w, "---")?;
-    writeln!(w, "§skipped")?;
-    writeln!(
-        w,
-        "#context Matched but left out to fit the budget, largest first ({} of {})",
-        shown,
-        by_size.len()
-    )?;
-    if no_stat {
-        writeln!(w, "#schema path:str:path kind:{}", KIND_ENUM)?;
-        for e in &by_size[..shown] {
-            writeln!(w, "{}\t{}", sif_str(&e.path.to_string_lossy()), e.kind)?;
-        }
-    } else {
-        writeln!(w, "#schema path:str:path size:uint kind:{} tokens_est:uint", KIND_ENUM)?;
-        for e in &by_size[..shown] {
-            writeln!(
+        if cuts.skipped_rows_dropped > 0 {
+            let _ = writeln!(
                 w,
-                "{}\t{}\t{}\t{}",
-                sif_str(&e.path.to_string_lossy()),
-                e.size,
-                e.kind,
-                e.tokens_est
-            )?;
+                "#truncated reason=output_budget dropped={} budget={} {}",
+                cuts.skipped_rows_dropped, budget, RECOVER
+            );
+        }
+        for r in &skipped_rows[..rows_shown] {
+            w.push_str(r);
         }
     }
-    Ok(())
+
+    if let Some(blocks) = blocks {
+        let _ = writeln!(w, "---");
+        let _ = writeln!(w, "§preview");
+        if binary_skipped > 0 {
+            let _ = writeln!(w, "#context {} binary file(s) not previewed", binary_skipped);
+        }
+        if cuts.preview_lines.is_some() || cuts.preview_blocks_dropped > 0 {
+            let _ = write!(w, "#truncated reason=output_budget");
+            if let Some(n) = cuts.preview_lines {
+                let _ = write!(w, " lines_per_file={}", n);
+            }
+            let _ = writeln!(w, " dropped={} budget={} {}", cuts.preview_blocks_dropped, budget, RECOVER);
+        }
+        let shown = blocks.len() - cuts.preview_blocks_dropped.min(blocks.len());
+        for b in &blocks[..shown] {
+            let _ = b.render(cuts.preview_lines.unwrap_or(usize::MAX), &mut w);
+        }
+    }
+    w
 }
 
 fn write_summary(
     entries: &[Entry],
     budget: &BudgetInfo,
     skipped: &[Entry],
-    order: Option<&Prefer>,
-    no_stat: bool,
-    w: &mut dyn Write,
-) -> std::fmt::Result {
+    opts: &SifOptions,
+    binary_skipped: usize,
+    cuts: Cuts,
+    w: &mut String,
+) {
     let total_files = entries.iter().filter(|e| !e.is_dir).count();
     let total_dirs = entries.iter().filter(|e| e.is_dir).count();
     let total_bytes: u64 = entries.iter().map(|e| e.size).sum();
@@ -208,36 +425,45 @@ fn write_summary(
         *kind_counts.entry(entry.kind.as_str()).or_insert(0) += 1;
     }
 
-    writeln!(w, "---")?;
-    writeln!(w, "§summary")?;
-    writeln!(w, "#schema key:str:id value:str note:str?")?;
-    writeln!(w, "total_files\t{}", total_files)?;
-    writeln!(w, "total_dirs\t{}", total_dirs)?;
-    if !no_stat {
-        writeln!(w, "total_bytes\t{}", total_bytes)?;
-        writeln!(w, "total_tokens_est\t{}", total_tokens)?;
+    let _ = writeln!(w, "---");
+    let _ = writeln!(w, "§summary");
+    let _ = writeln!(w, "#schema key:str:id value:str note:str?");
+    let _ = writeln!(w, "total_files\t{}", total_files);
+    let _ = writeln!(w, "total_dirs\t{}", total_dirs);
+    if !opts.no_stat {
+        let _ = writeln!(w, "total_bytes\t{}", total_bytes);
+        let _ = writeln!(w, "total_tokens_est\t{}", total_tokens);
     }
     if let Some(b) = budget.token_budget {
-        writeln!(w, "token_budget\t{}", b)?;
-        writeln!(w, "token_budget_remaining\t{}", b.saturating_sub(total_tokens))?;
+        let _ = writeln!(w, "token_budget\t{}", b);
+        let _ = writeln!(w, "token_budget_remaining\t{}", b.saturating_sub(total_tokens));
     }
     if let Some(b) = budget.byte_budget {
-        writeln!(w, "byte_budget\t{}", b)?;
-        writeln!(w, "byte_budget_remaining\t{}", b.saturating_sub(total_bytes))?;
+        let _ = writeln!(w, "byte_budget\t{}", b);
+        let _ = writeln!(w, "byte_budget_remaining\t{}", b.saturating_sub(total_bytes));
     }
-    if let Some(p) = order.filter(|p| !matches!(p, Prefer::Path)) {
-        writeln!(w, "prefer\t{}", p.as_str())?;
+    if let Some(p) = opts.order.as_ref().filter(|p| !matches!(p, Prefer::Path)) {
+        let _ = writeln!(w, "prefer\t{}", p.as_str());
     }
     let has_budget = budget.token_budget.is_some() || budget.byte_budget.is_some();
     if has_budget && budget.budget_mode == BudgetMode::Fit {
-        writeln!(w, "budget_mode\tfit")?;
-        writeln!(w, "budget_skipped_files\t{}", skipped.len())?;
-        writeln!(w, "budget_skipped_tokens_est\t{}", skipped.iter().map(|e| e.tokens_est).sum::<u64>())?;
-        writeln!(w, "budget_skipped_bytes\t{}", skipped.iter().map(|e| e.size).sum::<u64>())?;
+        let _ = writeln!(w, "budget_mode\tfit");
+        let _ = writeln!(w, "budget_skipped_files\t{}", skipped.len());
+        let _ = writeln!(w, "budget_skipped_tokens_est\t{}", skipped.iter().map(|e| e.tokens_est).sum::<u64>());
+        let _ = writeln!(w, "budget_skipped_bytes\t{}", skipped.iter().map(|e| e.size).sum::<u64>());
     }
     if let Some(reason) = budget.stopped_early {
-        writeln!(w, "stopped_early\t{}", reason.as_str())?;
+        let _ = writeln!(w, "stopped_early\t{}\tmore matches may exist", reason.as_str());
     }
+    if cuts.any() {
+        let _ = writeln!(
+            w,
+            "output_truncated\t{}\toutput capped at --max-output-tokens {}; use --max-output-tokens unlimited",
+            cuts.sections(),
+            opts.max_output_tokens.unwrap_or(0)
+        );
+    }
+
     // What was left out, with how to get it back. Zero counts are omitted.
     let p = &budget.pruned;
     for (key, count, note) in [
@@ -249,21 +475,21 @@ fn write_summary(
         ("filtered_kind", budget.filtered_kind, "matches of other kinds, dropped by -k"),
         ("filtered_git_changed", budget.filtered_git_changed, "matches unchanged since the -G ref"),
         ("unreadable_dirs", budget.unreadable_dirs, "directories that could not be read"),
+        ("preview_skipped_binary", binary_skipped, "binary files are not previewed"),
     ] {
         if count > 0 {
-            writeln!(w, "{}\t{}\t{}", key, count, note)?;
+            let _ = writeln!(w, "{}\t{}\t{}", key, count, note);
         }
     }
     if budget.wall_time_ms > 0 {
-        writeln!(w, "wall_time_ms\t{}", budget.wall_time_ms)?;
+        let _ = writeln!(w, "wall_time_ms\t{}", budget.wall_time_ms);
     }
 
     let mut kinds: Vec<_> = kind_counts.into_iter().collect();
     kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     for (kind, count) in kinds {
-        writeln!(w, "kind_{}\t{}", kind, count)?;
+        let _ = writeln!(w, "kind_{}\t{}", kind, count);
     }
-    Ok(())
 }
 
 /// Format entries as plain paths (one per line), for non-SIF consumers.

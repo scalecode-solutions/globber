@@ -60,33 +60,87 @@ impl PreviewMode {
     }
 }
 
-/// Append a §preview section with lines of each non-binary file.
-pub fn write_preview(entries: &[Entry], mode: &PreviewMode, w: &mut dyn Write) -> std::fmt::Result {
-    writeln!(w, "---")?;
-    writeln!(w, "§preview")?;
+/// One file's excerpt for a §preview section.
+#[derive(Debug, Clone)]
+pub struct PreviewBlock {
+    pub path: std::path::PathBuf,
+    pub language: Option<&'static str>,
+    /// 1-indexed line number of `lines[0]`.
+    pub start: usize,
+    pub lines: Vec<String>,
+}
 
-    for entry in entries {
-        if entry.is_dir || entry.kind == FileKind::Binary {
-            continue;
-        }
-        let Some((start, lines)) = preview_file(&entry.path, mode) else {
-            continue;
-        };
+impl PreviewBlock {
+    /// Render as a SIF code block, keeping at most `max_lines` lines.
+    pub fn render(&self, max_lines: usize, w: &mut dyn Write) -> std::fmt::Result {
+        let n = self.lines.len().min(max_lines);
         write!(w, "#block code")?;
-        if let Some(lang) = language(&entry.path) {
+        if let Some(lang) = self.language {
             write!(w, " language={}", lang)?;
         }
         writeln!(
             w,
             " file={} lines={}-{}",
-            sif_attr(&entry.path.to_string_lossy()),
-            start,
-            start + lines.len() - 1,
+            sif_attr(&self.path.to_string_lossy()),
+            self.start,
+            self.start + n - 1,
         )?;
-        for line in &lines {
+        for line in &self.lines[..n] {
             writeln!(w, "{}", line)?;
         }
-        writeln!(w, "#/block")?;
+        writeln!(w, "#/block")
+    }
+
+    /// Rendered size in bytes with at most `max_lines` lines.
+    pub fn rendered_len(&self, max_lines: usize) -> usize {
+        let mut s = String::new();
+        let _ = self.render(max_lines, &mut s);
+        s.len()
+    }
+}
+
+/// Read previews for every non-directory, non-binary entry, in order.
+/// Returns the blocks and how many files were skipped as binary.
+pub fn collect_previews(entries: &[Entry], mode: &PreviewMode) -> (Vec<PreviewBlock>, usize) {
+    use rayon::prelude::*;
+    let results: Vec<Result<Option<PreviewBlock>, ()>> = entries
+        .par_iter()
+        .map(|entry| {
+            if entry.is_dir {
+                return Ok(None);
+            }
+            if entry.kind == FileKind::Binary {
+                return Err(());
+            }
+            match preview_file(&entry.path, mode) {
+                Some((start, lines)) => Ok(Some(PreviewBlock {
+                    path: entry.path.clone(),
+                    language: language(&entry.path),
+                    start,
+                    lines,
+                })),
+                None if is_binary(&entry.path) => Err(()),
+                None => Ok(None),
+            }
+        })
+        .collect();
+    let binary = results.iter().filter(|r| r.is_err()).count();
+    (results.into_iter().filter_map(|r| r.ok().flatten()).collect(), binary)
+}
+
+fn is_binary(path: &Path) -> bool {
+    std::fs::File::open(path)
+        .ok()
+        .and_then(|f| BufReader::new(f).fill_buf().map(|b| b.contains(&0)).ok())
+        .unwrap_or(false)
+}
+
+/// Append a §preview section with lines of each non-binary file.
+pub fn write_preview(entries: &[Entry], mode: &PreviewMode, w: &mut dyn Write) -> std::fmt::Result {
+    writeln!(w, "---")?;
+    writeln!(w, "§preview")?;
+    for block in collect_previews(entries, mode).0 {
+        block.render(usize::MAX, w)?;
     }
     Ok(())
 }
