@@ -160,23 +160,17 @@ struct Node {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IgnoreStack {
     top: Option<Arc<Node>>,
-    /// Inside a git repository (its info/exclude and the global excludes
-    /// are already on the stack).
-    in_repo: bool,
 }
 
 impl IgnoreStack {
     fn push(&self, file: IgnoreFile) -> Self {
-        IgnoreStack {
-            top: Some(Arc::new(Node { file, parent: self.top.clone() })),
-            in_repo: self.in_repo,
-        }
+        IgnoreStack { top: Some(Arc::new(Node { file, parent: self.top.clone() })) }
     }
 
-    /// Rules in effect at the root of a walk: if the root is inside a git
-    /// repository, the global excludes, .git/info/exclude, and every
+    /// Rules in effect at the root of a walk: if the root is strictly inside
+    /// a git repository, the global excludes, .git/info/exclude, and every
     /// .gitignore from the repository root down to (not including) the
-    /// walk root. The walk root's own .gitignore is added by `enter_dir`.
+    /// walk root. The walk root's own files are added by `enter_dir`.
     pub(crate) fn for_walk_root(scope: &Path) -> Self {
         let Ok(canon) = fs::canonicalize(scope) else {
             return IgnoreStack::default();
@@ -184,6 +178,9 @@ impl IgnoreStack {
         let Some(repo) = canon.ancestors().find(|a| a.join(".git").exists()) else {
             return IgnoreStack::default();
         };
+        if repo == canon {
+            return IgnoreStack::default();
+        }
         let anchor = normalize(scope.to_path_buf());
         let rel_to = |dir: &Path| canon.strip_prefix(dir).map(Path::to_path_buf).unwrap_or_default();
 
@@ -191,30 +188,30 @@ impl IgnoreStack {
         for file in repo_level_files(repo, anchor.clone()) {
             stack = stack.push(file.with_prefix(rel_to(repo)));
         }
-        stack.in_repo = true;
-        if canon != repo {
-            // Ancestors between the repo root and the walk root, outermost first.
-            let mut dirs: Vec<&Path> = canon.ancestors().skip(1).take_while(|a| a.starts_with(repo)).collect();
-            dirs.reverse();
-            for dir in dirs {
-                if let Some(f) = IgnoreFile::load(&dir.join(".gitignore"), anchor.clone()) {
-                    stack = stack.push(f.with_prefix(rel_to(dir)));
-                }
+        // Ancestors between the repo root and the walk root, outermost first.
+        let mut dirs: Vec<&Path> =
+            canon.ancestors().skip(1).take_while(|a| a.starts_with(repo)).collect();
+        dirs.reverse();
+        for dir in dirs {
+            if let Some(f) = IgnoreFile::load(&dir.join(".gitignore"), anchor.clone()) {
+                stack = stack.push(f.with_prefix(rel_to(dir)));
             }
         }
         stack
     }
 
-    /// Extend the stack on entering `dir`: its .gitignore, and if `dir` is
-    /// a repository root not yet seen, its repo-level ignore files first.
-    pub(crate) fn enter_dir(&self, dir: &Path) -> Self {
+    /// Extend the stack on entering `dir` with its .gitignore. A repository
+    /// root (a directory containing `.git`) is a boundary, as in git: the
+    /// enclosing repository's rules stop applying, and the repository's
+    /// own global excludes and .git/info/exclude start.
+    pub(crate) fn enter_dir(&self, dir: &Path, is_repo_root: bool) -> Self {
         let anchor = normalize(dir.to_path_buf());
         let mut stack = self.clone();
-        if !stack.in_repo && dir.join(".git").exists() {
+        if is_repo_root {
+            stack = IgnoreStack::default();
             for file in repo_level_files(dir, anchor.clone()) {
                 stack = stack.push(file);
             }
-            stack.in_repo = true;
         }
         match IgnoreFile::load(&dir.join(".gitignore"), anchor) {
             Some(f) => stack.push(f),

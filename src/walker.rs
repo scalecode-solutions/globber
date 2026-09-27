@@ -88,6 +88,18 @@ pub struct WalkOptions {
     /// (cycles are detected and skipped). Symlinks named literally in the
     /// pattern are always followed.
     pub follow_symlinks: bool,
+    /// If true, don't descend into nested git repositories (directories
+    /// containing `.git`, including submodules) found below the walk root.
+    /// With `git_files`, don't list their files.
+    pub skip_nested_repos: bool,
+    /// If true, take the file list from git (`git ls-files --cached
+    /// --others --exclude-standard`) instead of reading directories:
+    /// exactly the files git considers part of the working tree, tracked
+    /// files included even if they match a .gitignore rule, recursing into
+    /// submodules and nested repositories. Yields files only; `gitignore`
+    /// and `follow_symlinks` have no effect. Each pattern's literal prefix
+    /// must be inside a git repository.
+    pub git_files: bool,
     /// Exclude patterns. A pattern containing `/` is matched against the
     /// full entry path (with `*` not crossing `/`); one without `/` is
     /// matched against the file name at any depth. Matching directories
@@ -112,6 +124,8 @@ impl Default for WalkOptions {
             no_stat: false,
             gitignore: false,
             follow_symlinks: false,
+            skip_nested_repos: false,
+            git_files: false,
             exclude: Vec::new(),
             filter: None,
         }
@@ -435,13 +449,7 @@ impl Walker<'_> {
         ancestors: &Ancestors,
         sink: &mut Sink,
     ) {
-        let ignores = if self.opts.gitignore {
-            ignores.enter_dir(dir)
-        } else {
-            ignores.clone()
-        };
-
-        let children = match self.children(dir, level, states, &ignores) {
+        let (children, ignores) = match self.children(dir, level, states, ignores) {
             Ok(c) => c,
             Err(error) => {
                 sink.push_err(GlobError::Io { path: dir.to_path_buf(), error });
@@ -507,13 +515,22 @@ impl Walker<'_> {
     }
 
     /// Enumerate and classify the children of `dir` against `states`.
+    /// Also returns the ignore stack in effect inside `dir`, which depends
+    /// on whether the listing shows `dir` to be a repository root.
     fn children(
         &self,
         dir: &Path,
         level: usize,
         states: &[State],
-        ignores: &IgnoreStack,
-    ) -> std::io::Result<Vec<Child>> {
+        parent_ignores: &IgnoreStack,
+    ) -> std::io::Result<(Vec<Child>, IgnoreStack)> {
+        let enter = |is_repo_root: bool| {
+            if self.opts.gitignore {
+                parent_ignores.enter_dir(dir, is_repo_root)
+            } else {
+                parent_ignores.clone()
+            }
+        };
         // Fast path: every live state is a literal name — stat, don't readdir.
         let literals: Option<Vec<String>> = if self.opts.match_opts.case_sensitive {
             states
@@ -524,9 +541,12 @@ impl Walker<'_> {
             None
         };
 
+        let ignores;
         let mut children: Vec<Child> = if let Some(mut names) = literals {
             names.sort();
             names.dedup();
+            ignores = enter(self.opts.gitignore && dir.join(".git").exists());
+            let ignores = &ignores;
             names
                 .into_par_iter()
                 .filter_map(|name| {
@@ -544,6 +564,8 @@ impl Walker<'_> {
         } else {
             let dir_entries: Vec<fs::DirEntry> =
                 fs::read_dir(dir)?.filter_map(|r| r.ok()).collect();
+            ignores = enter(dir_entries.iter().any(|de| de.file_name() == ".git"));
+            let ignores = &ignores;
             dir_entries
                 .into_par_iter()
                 .filter_map(|de| {
@@ -565,7 +587,7 @@ impl Walker<'_> {
         if self.opts.sorted {
             children.sort_by(|a, b| a.entry.path.file_name().cmp(&b.entry.path.file_name()));
         }
-        Ok(children)
+        Ok((children, ignores))
     }
 
     /// Decide whether a child is a result and which states survive into it.
@@ -583,6 +605,48 @@ impl Walker<'_> {
         states: &[State],
         ignores: &IgnoreStack,
     ) -> Option<Child> {
+        let (matched, mut next, explicit) = self.step(name, is_dir, level, states);
+
+        if !is_dir || (is_symlink && !self.opts.follow_symlinks && !explicit) {
+            next.clear();
+        }
+        if self.opts.skip_nested_repos && !explicit && !next.is_empty() && path.join(".git").exists() {
+            next.clear();
+        }
+
+        if !matched && next.is_empty() {
+            return None;
+        }
+
+        if self.opts.gitignore
+            && !explicit
+            && (name == ".git" || ignores.is_ignored(&path, is_dir))
+        {
+            return None;
+        }
+        if self.is_excluded(&path, name, is_dir) {
+            return None;
+        }
+
+        let entry = if matched {
+            match (de, self.opts.no_stat) {
+                (Some(de), false) => Entry::from_dir_entry(path, de),
+                (Some(de), true) => Entry::from_dir_entry_lightweight(path, de),
+                (None, _) => self.make_entry(path, None),
+            }
+        } else {
+            // Only descending through it: skip the stat.
+            Entry::bare_dir(path, is_symlink)
+        };
+
+        Some(Child { entry, is_result: matched, next })
+    }
+
+    /// Match one path component (a child of a directory at `level`)
+    /// against the live states. Returns whether it completes a pattern,
+    /// the states to match its children against (depth-limited), and
+    /// whether it was reached only through literal-prefix components.
+    fn step(&self, name: &str, is_dir: bool, level: usize, states: &[State]) -> (bool, Vec<State>, bool) {
         let child_level = level + 1;
         let mopts = self.opts.match_opts;
         let hidden = mopts.require_literal_leading_dot && name.starts_with('.');
@@ -621,38 +685,12 @@ impl Walker<'_> {
             }
         }
 
-        if !is_dir || (is_symlink && !self.opts.follow_symlinks && !explicit) {
+        if !is_dir {
             next.clear();
         }
         // Drop states that could only match beyond max_depth.
         next.retain(|&(p, _)| self.depth_ok(p, child_level + 1));
-
-        if !matched && next.is_empty() {
-            return None;
-        }
-
-        if self.opts.gitignore
-            && !explicit
-            && (name == ".git" || ignores.is_ignored(&path, is_dir))
-        {
-            return None;
-        }
-        if self.is_excluded(&path, name, is_dir) {
-            return None;
-        }
-
-        let entry = if matched {
-            match (de, self.opts.no_stat) {
-                (Some(de), false) => Entry::from_dir_entry(path, de),
-                (Some(de), true) => Entry::from_dir_entry_lightweight(path, de),
-                (None, _) => self.make_entry(path, None),
-            }
-        } else {
-            // Only descending through it: skip the stat.
-            Entry::bare_dir(path, is_symlink)
-        };
-
-        Some(Child { entry, is_result: matched, next })
+        (matched, next, explicit)
     }
 
     fn make_entry(&self, path: PathBuf, de: Option<&fs::DirEntry>) -> Entry {

@@ -50,6 +50,8 @@ struct GlobArgs {
     gitignore: bool,
     follow: bool,
     fit: bool,
+    skip_nested_repos: bool,
+    git_files: bool,
     preview: Option<PreviewMode>,
     git_changed: Option<String>,
 }
@@ -163,6 +165,8 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
         gitignore: false,
         follow: false,
         fit: false,
+        skip_nested_repos: false,
+        git_files: false,
         preview: None,
         git_changed: None,
     };
@@ -184,6 +188,7 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
             "--hidden" | "-a" => ga.hidden = true,
             "--follow" | "-L" => ga.follow = true,
             "--fit" => ga.fit = true,
+            "--skip-nested-repos" => ga.skip_nested_repos = true,
             "--dirs" | "-d" => ga.only_dirs = true,
             "--preview" | "-P" => {
                 let val = args.value(&flag, "a spec (N, N-M, or code:N)")?;
@@ -426,6 +431,7 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
         no_stat: ga.no_stat,
         gitignore: ga.gitignore,
         follow_symlinks: ga.follow,
+        skip_nested_repos: ga.skip_nested_repos,
         budget_mode: if ga.fit { BudgetMode::Fit } else { BudgetMode::Stop },
         exclude,
         filter,
@@ -656,6 +662,14 @@ OPTIONS
       and the global excludes file ($XDG_CONFIG_HOME/git/ignore or
       ~/.config/git/ignore). Also skips .git/ directories. Directories
       named literally at the start of the pattern are never skipped.
+      A nested repository (a directory containing .git, e.g. a submodule)
+      is a boundary: the outer repository's rules stop applying inside
+      it and its own take over, as in git. Tracked files that match an
+      ignore rule are skipped (a walk can't see git's index); use
+      --git-files for git's exact view.
+
+  --skip-nested-repos
+      Don't descend into nested repositories or submodules below the root.
 
   -G, --git-changed [REF]
       Only include files changed since REF: committed, staged, unstaged,

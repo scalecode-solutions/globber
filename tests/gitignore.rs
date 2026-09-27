@@ -153,3 +153,36 @@ fn pathological_gitignore_lines() {
     write(dir.path(), "fine.rs", "x");
     assert_eq!(run(dir.path(), "*"), vec!["fine.rs"]);
 }
+
+#[test]
+fn nested_repo_is_an_ignore_boundary() {
+    let dir = repo();
+    let r = dir.path();
+    // A nested repository: the outer *.log rule must not apply inside it,
+    // and its own info/exclude must.
+    fs::create_dir_all(r.join("vendor/lib/.git/info")).unwrap();
+    write(r, "vendor/lib/.git/info/exclude", "*.tmp\n");
+    write(r, "vendor/lib/debug.log", "x");
+    write(r, "vendor/lib/scratch.tmp", "x");
+    write(r, "vendor/lib/code.rs", "x");
+    let got = run(r, "vendor/**");
+    assert_eq!(got, vec!["vendor/lib", "vendor/lib/code.rs", "vendor/lib/debug.log"]);
+}
+
+#[test]
+fn skip_nested_repos_option() {
+    let dir = repo();
+    let r = dir.path();
+    fs::create_dir_all(r.join("vendor/lib/.git")).unwrap();
+    write(r, "vendor/lib/code.rs", "x");
+    write(r, "vendor/own.rs", "x");
+    let opts = WalkOptions { skip_nested_repos: true, ..WalkOptions::default() };
+    let got: Vec<String> = walk(&format!("{}/vendor/**", r.display()), opts)
+        .unwrap()
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .map(|e| e.path.strip_prefix(r).unwrap().to_string_lossy().into_owned())
+        .collect();
+    // The nested repo is listed but not entered.
+    assert_eq!(got, vec!["vendor/lib", "vendor/own.rs"]);
+}
