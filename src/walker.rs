@@ -14,6 +14,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use rayon::prelude::*;
 
@@ -347,6 +348,26 @@ pub struct WalkReport {
     /// Set if the walk stopped early; matches after that point were not
     /// examined.
     pub stopped_early: Option<StopReason>,
+    /// Entries skipped by each pruning rule. A pruned directory counts
+    /// once — its contents are never read.
+    pub pruned: PruneCounts,
+}
+
+/// How many entries each pruning rule left out. Only entries that would
+/// otherwise have matched or been descended into are counted, and a
+/// pruned directory counts as one entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneCounts {
+    /// Dot-names wildcards skipped (`-a` includes them).
+    pub hidden: usize,
+    /// Entries matching a gitignore rule (`-g`).
+    pub gitignore: usize,
+    /// Entries matching an exclude pattern (`-e`).
+    pub exclude: usize,
+    /// Nested repositories not entered (`skip_nested_repos`).
+    pub nested_repos: usize,
+    /// Symlinked directories listed but not entered (`follow_symlinks`).
+    pub symlink_dirs: usize,
 }
 
 /// Walk the filesystem matching any of several patterns in a single pass.
@@ -384,11 +405,12 @@ pub fn walk_many_report<S: AsRef<str>>(
     let parallel =
         opts.limit.is_none() && opts.byte_budget.is_none() && opts.token_budget.is_none();
     let mut sink = Sink::new(&opts);
+    let counts = Counters::default();
     for (root, pats) in &groups {
         if sink.stopped {
             break;
         }
-        let walker = Walker { opts: &opts, pats, parallel };
+        let walker = Walker { opts: &opts, pats, parallel, counts: &counts };
         if opts.git_files {
             walker.walk_git(root, &mut sink);
         } else {
@@ -417,6 +439,7 @@ pub fn walk_many_report<S: AsRef<str>>(
         results,
         budget_skipped: sink.budget_skipped,
         stopped_early: sink.stopped_early,
+        pruned: counts.snapshot(),
     })
 }
 
@@ -457,6 +480,7 @@ fn walk_ranked<S: AsRef<str>>(patterns: &[S], opts: WalkOptions) -> Result<WalkR
         results,
         budget_skipped: sink.budget_skipped,
         stopped_early: sink.stopped_early,
+        pruned: all.pruned,
     })
 }
 
@@ -646,7 +670,30 @@ impl Sink {
 
 // ── The walker ───────────────────────────────────────────────────────
 
+/// Entries left out by pruning, counted during a walk (shared by threads).
+#[derive(Default)]
+struct Counters {
+    hidden: AtomicUsize,
+    gitignore: AtomicUsize,
+    exclude: AtomicUsize,
+    nested_repos: AtomicUsize,
+    symlink_dirs: AtomicUsize,
+}
+
+impl Counters {
+    fn snapshot(&self) -> PruneCounts {
+        PruneCounts {
+            hidden: self.hidden.load(Relaxed),
+            gitignore: self.gitignore.load(Relaxed),
+            exclude: self.exclude.load(Relaxed),
+            nested_repos: self.nested_repos.load(Relaxed),
+            symlink_dirs: self.symlink_dirs.load(Relaxed),
+        }
+    }
+}
+
 struct Walker<'a> {
+    counts: &'a Counters,
     opts: &'a WalkOptions,
     pats: &'a [Compiled],
     parallel: bool,
@@ -757,7 +804,7 @@ impl Walker<'_> {
             }
         }
 
-        let mut candidates: Vec<PathBuf> = Vec::new();
+        let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
         for base in &outer {
             let dir = base
                 .iter()
@@ -765,15 +812,15 @@ impl Walker<'_> {
             if !dir.is_dir() {
                 continue;
             }
-            match crate::git::repo_files(&dir, !self.opts.skip_nested_repos) {
-                Ok(files) => candidates.extend(files.into_iter().map(|f| base.join(f))),
+            match crate::git::list_files(&dir, !self.opts.skip_nested_repos) {
+                Ok(files) => candidates.extend(files.into_iter().map(|(f, t)| (base.join(f), t))),
                 Err(message) => sink.push_err(GlobError::Git { path: dir, message }),
             }
         }
 
         let mut matched: Vec<PathBuf> = candidates
             .into_par_iter()
-            .filter_map(|rel| self.match_rel(&scope, &rel, &states))
+            .filter_map(|(rel, tracked)| self.match_rel(&scope, &rel, tracked, &states))
             .collect();
         matched.par_sort();
         matched.dedup();
@@ -807,22 +854,29 @@ impl Walker<'_> {
 
     /// Match a scope-relative file path against the patterns, treating
     /// every component but the last as a directory. Returns the walk path.
-    fn match_rel(&self, scope: &Path, rel: &Path, initial: &[State]) -> Option<PathBuf> {
+    ///
+    /// Tracked files may be dotfiles: git already chose them, so wildcards
+    /// match them without -a.
+    fn match_rel(&self, scope: &Path, rel: &Path, tracked: bool, initial: &[State]) -> Option<PathBuf> {
         let names: Vec<&str> = rel.iter().map(|c| c.to_str()).collect::<Option<_>>()?;
         let mut states = initial.to_vec();
         let mut path = scope.to_path_buf();
         for (level, name) in names.iter().enumerate() {
             let last = level + 1 == names.len();
             path = join(&path, name);
-            let (matched, next, _) = self.step(name, !last, level, &states);
+            let (matched, next, _) = self.step(name, !last, level, &states, tracked);
+            if (last && !matched) || (!last && next.is_empty()) {
+                if !tracked {
+                    self.count_if_hidden(name, !last, level, &states);
+                }
+                return None;
+            }
             if self.is_excluded(&path, name, !last) {
+                self.counts.exclude.fetch_add(1, Relaxed);
                 return None;
             }
             if last {
-                return matched.then_some(path);
-            }
-            if next.is_empty() {
-                return None;
+                return Some(path);
             }
             states = next;
         }
@@ -1012,26 +1066,36 @@ impl Walker<'_> {
         states: &[State],
         ignores: &IgnoreStack,
     ) -> Option<Child> {
-        let (matched, mut next, explicit) = self.step(name, is_dir, level, states);
+        let (matched, mut next, explicit) = self.step(name, is_dir, level, states, false);
 
-        if !is_dir || (is_symlink && !self.opts.follow_symlinks && !explicit) {
+        if !is_dir {
             next.clear();
+        }
+        if is_symlink && !self.opts.follow_symlinks && !explicit && !next.is_empty() {
+            next.clear();
+            self.counts.symlink_dirs.fetch_add(1, Relaxed);
         }
         if self.opts.skip_nested_repos && !explicit && !next.is_empty() && path.join(".git").exists() {
             next.clear();
+            self.counts.nested_repos.fetch_add(1, Relaxed);
         }
 
         if !matched && next.is_empty() {
+            self.count_if_hidden(name, is_dir, level, states);
             return None;
         }
 
-        if self.opts.gitignore
-            && !explicit
-            && (name == ".git" || ignores.is_ignored(&path, is_dir))
-        {
-            return None;
+        if self.opts.gitignore && !explicit {
+            if name == ".git" {
+                return None;
+            }
+            if ignores.is_ignored(&path, is_dir) {
+                self.counts.gitignore.fetch_add(1, Relaxed);
+                return None;
+            }
         }
         if self.is_excluded(&path, name, is_dir) {
+            self.counts.exclude.fetch_add(1, Relaxed);
             return None;
         }
 
@@ -1049,13 +1113,33 @@ impl Walker<'_> {
         Some(Child { entry, is_result: matched, next })
     }
 
+    /// Count a non-matching dot-name that would have matched with -a.
+    fn count_if_hidden(&self, name: &str, is_dir: bool, level: usize, states: &[State]) {
+        if self.opts.match_opts.require_literal_leading_dot && name.starts_with('.') && name != ".git" {
+            let (m, n, _) = self.step(name, is_dir, level, states, true);
+            if m || !n.is_empty() {
+                self.counts.hidden.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
     /// Match one path component (a child of a directory at `level`)
     /// against the live states. Returns whether it completes a pattern,
     /// the states to match its children against (depth-limited), and
     /// whether it was reached only through literal-prefix components.
-    fn step(&self, name: &str, is_dir: bool, level: usize, states: &[State]) -> (bool, Vec<State>, bool) {
+    fn step(
+        &self,
+        name: &str,
+        is_dir: bool,
+        level: usize,
+        states: &[State],
+        allow_hidden: bool,
+    ) -> (bool, Vec<State>, bool) {
         let child_level = level + 1;
-        let mopts = self.opts.match_opts;
+        let mut mopts = self.opts.match_opts;
+        if allow_hidden {
+            mopts.require_literal_leading_dot = false;
+        }
         let hidden = mopts.require_literal_leading_dot && name.starts_with('.');
 
         let mut next: Vec<State> = Vec::new();

@@ -7,6 +7,8 @@
 
 use std::env;
 use std::process;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use globber::{
     to_paths, to_sif_with, BudgetInfo, BudgetMode, Prefer, Entry, EntryFilter, FileKind, MatchOptions, PreviewMode,
@@ -433,12 +435,22 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
         None => None,
     };
     let kinds = ga.kind_filter.clone();
+    let filtered_kind = Arc::new(AtomicUsize::new(0));
+    let filtered_changed = Arc::new(AtomicUsize::new(0));
     let filter = if kinds.is_empty() && changed.is_none() {
         None
     } else {
+        let (fk, fc) = (filtered_kind.clone(), filtered_changed.clone());
         Some(EntryFilter::new(move |e: &Entry| {
-            (kinds.is_empty() || kinds.contains(&e.kind))
-                && changed.as_ref().is_none_or(|c| c.contains(&e.path))
+            if !kinds.is_empty() && !kinds.contains(&e.kind) {
+                fk.fetch_add(1, Relaxed);
+                return false;
+            }
+            if changed.as_ref().is_some_and(|c| !c.contains(&e.path)) {
+                fc.fetch_add(1, Relaxed);
+                return false;
+            }
+            true
         }))
     };
 
@@ -524,6 +536,9 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
                 unreadable_dirs: errors.len(),
                 budget_mode: if ga.fit { BudgetMode::Fit } else { BudgetMode::Stop },
                 stopped_early: report.stopped_early,
+                pruned: report.pruned,
+                filtered_kind: filtered_kind.load(Relaxed),
+                filtered_git_changed: filtered_changed.load(Relaxed),
             });
             let order = match prefer {
                 Prefer::Path if !ga.sorted => None,
@@ -685,7 +700,9 @@ OPTIONS
   -S, --summary
       Append a §summary section: total files, dirs, bytes, estimated
       tokens, kind breakdown, wall time, budget remaining (if a budget
-      was set), what --fit skipped, stopped_early (limit, token_budget or
+      was set), what --fit skipped, what each rule left out (pruned_hidden,
+      pruned_gitignore, pruned_exclude, filtered_kind, ... each with a
+      note on how to include it; a pruned directory counts once), stopped_early (limit, token_budget or
       byte_budget) if the walk was cut short — more matches may exist —
       and unreadable directories. SIF output only.
 

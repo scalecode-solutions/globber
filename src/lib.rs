@@ -117,7 +117,7 @@ pub use pattern::{Pattern, expand_braces, try_expand_braces, MAX_BRACE_EXPANSION
 pub use matcher::MatchOptions;
 pub use entry::{Entry, FileKind};
 pub use walker::{
-    BudgetMode, EntryFilter, Prefer, ScoreMap, StopReason, WalkOptions, WalkReport, WalkResult, walk, walk_many,
+    BudgetMode, EntryFilter, Prefer, PruneCounts, ScoreMap, StopReason, WalkOptions, WalkReport, WalkResult, walk, walk_many,
     walk_many_report,
 };
 pub use ruleset::Ruleset;

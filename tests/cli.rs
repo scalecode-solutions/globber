@@ -431,6 +431,7 @@ fn git_files_is_gits_view() {
     assert_eq!(
         lines(&out),
         vec![
+            ".gitignore",
             "Cargo.toml",
             "README.md",
             "docs/guide.md",
@@ -463,7 +464,7 @@ fn git_files_with_patterns_filters_and_limits() {
     );
     assert_eq!(
         lines(&globber(d, &["**", "--git-files", "--depth", "1", "-p"])),
-        vec!["Cargo.toml", "README.md", "notes.txt"]
+        vec![".gitignore", "Cargo.toml", "README.md", "notes.txt"]
     );
     assert_eq!(
         lines(&globber(d, &["**/*.rs", "--git-files", "--skip-nested-repos", "-p"])),
@@ -472,13 +473,62 @@ fn git_files_with_patterns_filters_and_limits() {
 }
 
 #[test]
-fn git_files_hidden_rules_apply() {
+fn git_files_tracked_dotfiles_need_no_flag() {
     let dir = git_project();
     let d = dir.path();
-    let out = lines(&globber(d, &["**", "--git-files", "-a", "-p"]));
-    assert!(out.contains(&".gitignore".to_string()));
+    write(d, ".local-notes", "untracked, not ignored");
+    // Tracked dotfiles match without -a; untracked ones still need it.
     let out = lines(&globber(d, &["**", "--git-files", "-p"]));
-    assert!(!out.contains(&".gitignore".to_string()));
+    assert!(out.contains(&".gitignore".to_string()));
+    assert!(!out.contains(&".local-notes".to_string()));
+    let out = stdout(&globber(d, &["**", "--git-files", "-S"]));
+    assert!(out.contains("pruned_hidden\t1\tdot-names skipped by wildcards; use -a to include\n"), "{}", out);
+    let out = lines(&globber(d, &["**", "--git-files", "-a", "-p"]));
+    assert!(out.contains(&".local-notes".to_string()));
+}
+
+// ── What was left out ───────────────────────────────────────────────
+
+#[test]
+fn summary_counts_pruned_and_filtered() {
+    let dir = project();
+    let d = dir.path();
+    write(d, ".hidden/secret.rs", "x");
+    write(d, ".env", "x");
+    let out = stdout(&globber(d, &["**/*.rs", "-g", "-e", "util", "-k", "source", "-S"]));
+    // .hidden (a dir, counts once); .env doesn't match *.rs so isn't counted.
+    assert!(out.contains("pruned_hidden\t1\t"), "{}", out);
+    // /target and docs/build/ (two pruned dirs).
+    assert!(out.contains("pruned_gitignore\t2\t"), "{}", out);
+    assert!(out.contains("pruned_exclude\t1\t"), "{}", out);
+    assert!(out.contains("#schema key:str:id value:str note:str?\n"));
+    // src/target/keep.rs is classified as build output (a `target` dir).
+    assert!(out.contains("filtered_kind\t1\t"), "{}", out);
+    let out = stdout(&globber(d, &["src/*.rs", "-S"]));
+    assert!(!out.contains("pruned_") && !out.contains("filtered_"), "{}", out);
+}
+
+#[test]
+fn summary_counts_git_changed_filter() {
+    let dir = project();
+    let d = dir.path();
+    git(d, &["init", "-q"]);
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-qm", "init"]);
+    write(d, "src/main.rs", "changed");
+    let out = stdout(&globber(d, &["src/*.rs", "-G", "-S"]));
+    assert!(out.contains("filtered_git_changed\t1\t"), "{}", out); // lib.rs unchanged
+}
+
+#[cfg(unix)]
+#[test]
+fn summary_counts_symlinked_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "real/a.rs", "x");
+    write(dir.path(), "tree/b.rs", "x");
+    std::os::unix::fs::symlink("../real", dir.path().join("tree/link")).unwrap();
+    let out = stdout(&globber(dir.path(), &["tree/**/*.rs", "-S"]));
+    assert!(out.contains("pruned_symlink_dirs\t1\tsymlinked directories not entered; use -L to follow\n"));
 }
 
 #[test]

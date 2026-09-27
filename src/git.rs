@@ -78,26 +78,36 @@ pub fn changed_files(root: &Path, ref_name: &str) -> Result<Vec<PathBuf>, String
 /// Paths are relative to `dir`. With `nested`, recurses into initialized
 /// submodules and untracked nested repositories.
 pub fn repo_files(dir: &Path, nested: bool) -> Result<Vec<PathBuf>, String> {
-    let listing = git(dir, &["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
-        .map_err(|e| {
-            if e.contains("not a git repository") {
-                format!("not a git repository: {}", dir.display())
-            } else {
-                e
-            }
-        })?;
+    Ok(list_files(dir, nested)?.into_iter().map(|(p, _)| p).collect())
+}
+
+/// Like [`repo_files`], also saying whether each file is tracked.
+pub(crate) fn list_files(dir: &Path, nested: bool) -> Result<Vec<(PathBuf, bool)>, String> {
+    let not_repo = |e: String| {
+        if e.contains("not a git repository") {
+            format!("not a git repository: {}", dir.display())
+        } else {
+            e
+        }
+    };
+    let tracked = git(dir, &["ls-files", "--cached", "-z"]).map_err(not_repo)?;
+    let untracked = git(dir, &["ls-files", "--others", "--exclude-standard", "-z"]).map_err(not_repo)?;
     let submodules = submodule_paths(dir);
 
     let mut files = Vec::new();
     let mut nested_dirs = Vec::new();
-    for p in listing.split('\0').filter(|p| !p.is_empty()) {
+    let listed = tracked
+        .split('\0')
+        .map(|p| (p, true))
+        .chain(untracked.split('\0').map(|p| (p, false)));
+    for (p, is_tracked) in listed.filter(|(p, _)| !p.is_empty()) {
         if let Some(d) = p.strip_suffix('/') {
             // Untracked nested repository: git lists it, not its contents.
             nested_dirs.push(PathBuf::from(d));
-        } else if submodules.iter().any(|s| s == Path::new(p)) {
+        } else if is_tracked && submodules.iter().any(|s| s == Path::new(p)) {
             nested_dirs.push(PathBuf::from(p));
         } else {
-            files.push(PathBuf::from(p));
+            files.push((PathBuf::from(p), is_tracked));
         }
     }
 
@@ -105,8 +115,8 @@ pub fn repo_files(dir: &Path, nested: bool) -> Result<Vec<PathBuf>, String> {
         for d in nested_dirs {
             let sub = dir.join(&d);
             if sub.join(".git").exists() {
-                if let Ok(inner) = repo_files(&sub, true) {
-                    files.extend(inner.into_iter().map(|f| d.join(f)));
+                if let Ok(inner) = list_files(&sub, true) {
+                    files.extend(inner.into_iter().map(|(f, t)| (d.join(f), t)));
                 }
             }
         }

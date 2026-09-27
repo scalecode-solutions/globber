@@ -13,7 +13,7 @@
 use std::fmt::Write;
 
 use crate::entry::Entry;
-use crate::walker::{BudgetMode, Prefer, StopReason};
+use crate::walker::{BudgetMode, Prefer, PruneCounts, StopReason};
 
 /// The `kind` column type: every [`FileKind`](crate::FileKind) name.
 const KIND_ENUM: &str = "enum(source,test,config,build,doc,data,generated,binary,unknown)";
@@ -53,6 +53,12 @@ pub struct BudgetInfo {
     pub budget_mode: BudgetMode,
     /// Why the walk stopped early, if it did.
     pub stopped_early: Option<StopReason>,
+    /// Entries left out by pruning rules.
+    pub pruned: PruneCounts,
+    /// Matches dropped by the `-k` kind filter.
+    pub filtered_kind: usize,
+    /// Matches dropped by `-G` (unchanged since the ref).
+    pub filtered_git_changed: usize,
 }
 
 /// Format a list of entries as a SIF document string.
@@ -204,7 +210,7 @@ fn write_summary(
 
     writeln!(w, "---")?;
     writeln!(w, "§summary")?;
-    writeln!(w, "#schema key:str:id value:str")?;
+    writeln!(w, "#schema key:str:id value:str note:str?")?;
     writeln!(w, "total_files\t{}", total_files)?;
     writeln!(w, "total_dirs\t{}", total_dirs)?;
     if !no_stat {
@@ -232,8 +238,21 @@ fn write_summary(
     if let Some(reason) = budget.stopped_early {
         writeln!(w, "stopped_early\t{}", reason.as_str())?;
     }
-    if budget.unreadable_dirs > 0 {
-        writeln!(w, "unreadable_dirs\t{}", budget.unreadable_dirs)?;
+    // What was left out, with how to get it back. Zero counts are omitted.
+    let p = &budget.pruned;
+    for (key, count, note) in [
+        ("pruned_hidden", p.hidden, "dot-names skipped by wildcards; use -a to include"),
+        ("pruned_gitignore", p.gitignore, "matched a gitignore rule; drop -g to include"),
+        ("pruned_exclude", p.exclude, "matched an -e pattern"),
+        ("pruned_nested_repos", p.nested_repos, "nested repositories not entered; drop --skip-nested-repos"),
+        ("pruned_symlink_dirs", p.symlink_dirs, "symlinked directories not entered; use -L to follow"),
+        ("filtered_kind", budget.filtered_kind, "matches of other kinds, dropped by -k"),
+        ("filtered_git_changed", budget.filtered_git_changed, "matches unchanged since the -G ref"),
+        ("unreadable_dirs", budget.unreadable_dirs, "directories that could not be read"),
+    ] {
+        if count > 0 {
+            writeln!(w, "{}\t{}\t{}", key, count, note)?;
+        }
     }
     if budget.wall_time_ms > 0 {
         writeln!(w, "wall_time_ms\t{}", budget.wall_time_ms)?;
