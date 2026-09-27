@@ -19,7 +19,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::matcher::MatchOptions;
 use crate::pattern::Pattern;
@@ -237,14 +237,35 @@ impl IgnoreStack {
 /// `repo`, lowest precedence first. Rules are anchored at `anchor`.
 fn repo_level_files(repo: &Path, anchor: PathBuf) -> Vec<IgnoreFile> {
     let mut files = Vec::new();
-    if let Some(global) = global_excludes_path() {
+    if let Some(global) = global_excludes_path(repo) {
         files.extend(IgnoreFile::load(&global, anchor.clone()));
     }
     files.extend(IgnoreFile::load(&repo.join(".git/info/exclude"), anchor));
     files
 }
 
-fn global_excludes_path() -> Option<PathBuf> {
+/// The global excludes file: `core.excludesFile` if configured, else git's
+/// default ($XDG_CONFIG_HOME/git/ignore or ~/.config/git/ignore).
+///
+/// Resolved once per process with `git config` (run in the first
+/// repository encountered), so `~` expansion, includes and conditional
+/// includes behave exactly as in git.
+fn global_excludes_path(repo: &Path) -> Option<PathBuf> {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| configured_excludes_file(repo).or_else(default_excludes_path)).clone()
+}
+
+fn configured_excludes_file(repo: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--path", "--get", "core.excludesFile"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn default_excludes_path() -> Option<PathBuf> {
     match std::env::var_os("XDG_CONFIG_HOME") {
         Some(x) if !x.is_empty() => Some(PathBuf::from(x).join("git/ignore")),
         _ => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/git/ignore")),

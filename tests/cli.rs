@@ -378,3 +378,26 @@ fn no_stat_schema() {
     assert!(out.contains("README.md\tdoc\tfalse\n"));
     assert!(!out.contains("total_bytes"));
 }
+
+#[test]
+fn core_excludes_file_is_honored() {
+    let dir = project();
+    let d = dir.path();
+    git(d, &["init", "-q"]);
+    let cfg = tempfile::tempdir().unwrap();
+    let excludes = cfg.path().join("my-excludes");
+    fs::write(&excludes, "*.txt\n").unwrap();
+    let gitconfig = cfg.path().join("gitconfig");
+    fs::write(&gitconfig, format!("[core]\n\texcludesFile = {}\n", excludes.display())).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_globber"))
+        .args(["*", "-g", "-p"])
+        .current_dir(d)
+        .env("GIT_CONFIG_GLOBAL", &gitconfig)
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .output()
+        .unwrap();
+    let got = lines(&out);
+    assert!(!got.contains(&"notes.txt".to_string()), "{:?}", got);
+    assert!(got.contains(&"README.md".to_string()));
+}

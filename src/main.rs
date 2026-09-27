@@ -659,8 +659,8 @@ OPTIONS
   -g, --gitignore
       Skip files ignored by git: .gitignore files (including those in
       parent directories up to the repository root), .git/info/exclude,
-      and the global excludes file ($XDG_CONFIG_HOME/git/ignore or
-      ~/.config/git/ignore). Also skips .git/ directories. Directories
+      and the global excludes file (core.excludesFile, or git's default
+      $XDG_CONFIG_HOME/git/ignore / ~/.config/git/ignore). Also skips .git/ directories. Directories
       named literally at the start of the pattern are never skipped.
       A nested repository (a directory containing .git, e.g. a submodule)
       is a boundary: the outer repository's rules stop applying inside
