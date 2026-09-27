@@ -54,6 +54,14 @@ globber '**/*.rs' -g -k source -P code:15 -S
 globber '**/*.{rs,go,py}' -g -t 80K -S
 globber '**/*.{rs,go,py}' -g -t 80K --fit -S
 
+# Give the budget to the big files first, or to what changed recently
+globber 'src/**/*.rs' -g -t 60K --fit --prefer size
+globber 'src/**/*.rs' -g -n 20 --prefer recent
+
+# Or to whatever another tool ranks highest (here: churn over 90 days)
+git log --since=90.days --name-only --format= | sort | uniq -c \
+  | globber 'src/**' -g -t 60K --fit --prefer-from -
+
 # Files this branch changed relative to main
 globber '**/*.rs' -G main -P code:10
 
@@ -67,7 +75,14 @@ globber '**/*.rs' --git-files -p
 With `--fit`, files that don't fit leave holes in the sorted listing, so
 globber always names them: a `§skipped` section (largest first), a stderr
 note with `-p`, and `budget_skipped_*` lines in `-S`. A walk cut short by
-`-n` or a stop-mode budget reports `stopped_early` in `-S`.
+`-n` or a stop-mode budget reports `stopped_early` in `-S`, and `-S`
+counts what every other rule left out (`pruned_hidden`, `pruned_gitignore`,
+`filtered_kind`, ...) with a note on how to include it.
+
+globber also caps its own output: SIF documents stay under
+`--max-output-tokens` (default 25K). Previews shrink first, then whole
+sections, and every cut is marked with a SIF `#truncated` directive. Use
+`--max-output-tokens unlimited` for everything.
 
 Limits never take `0`: `-n`, `-t`, `--byte-budget` and `--depth` require a
 positive value, or `unlimited` to remove a cap explicitly. See
