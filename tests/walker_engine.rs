@@ -414,3 +414,24 @@ fn case_insensitive_walk_skips_literal_fast_path() {
     let got = run(dir.path(), &["SRC/MAIN.RS"], opts);
     assert_eq!(got, vec!["src/main.rs"]);
 }
+
+#[test]
+fn report_lists_fit_skips_and_stop_reason() {
+    let dir = budget_tree();
+    let pat = format!("{}/*", dir.path().display());
+    let opts = WalkOptions {
+        token_budget: Some(100),
+        budget_mode: BudgetMode::Fit,
+        ..WalkOptions::default()
+    };
+    let report = globber::walk_many_report(&[&pat], opts).unwrap();
+    assert_eq!(report.results.len(), 2);
+    assert_eq!(report.budget_skipped.len(), 1);
+    assert!(report.budget_skipped[0].path.ends_with("a_big.txt"));
+    assert_eq!(report.stopped_early, None);
+
+    let opts = WalkOptions { token_budget: Some(100), ..WalkOptions::default() };
+    let report = globber::walk_many_report(&[&pat], opts).unwrap();
+    assert_eq!(report.stopped_early, Some(globber::StopReason::TokenBudget));
+    assert!(report.budget_skipped.is_empty());
+}

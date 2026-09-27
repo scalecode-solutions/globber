@@ -13,6 +13,7 @@
 use std::fmt::Write;
 
 use crate::entry::Entry;
+use crate::walker::{BudgetMode, StopReason};
 
 /// The `kind` column type: every [`FileKind`](crate::FileKind) name.
 const KIND_ENUM: &str = "enum(source,test,config,build,doc,data,generated,binary,unknown)";
@@ -25,7 +26,13 @@ pub struct SifOptions {
     pub no_stat: bool,
     /// Append a §summary section with these budget figures.
     pub summary: Option<BudgetInfo>,
+    /// Matches left out by a `--fit` budget. When non-empty, a §skipped
+    /// section lists the largest of them (see [`MAX_SKIPPED_LISTED`]).
+    pub budget_skipped: Vec<Entry>,
 }
+
+/// How many budget-skipped entries the §skipped section lists.
+pub const MAX_SKIPPED_LISTED: usize = 50;
 
 /// Budget and timing figures for the §summary section.
 #[derive(Debug, Clone, Default)]
@@ -38,6 +45,10 @@ pub struct BudgetInfo {
     pub wall_time_ms: u64,
     /// Directories that could not be read during the walk.
     pub unreadable_dirs: usize,
+    /// Budget behavior, reported when a budget is set.
+    pub budget_mode: BudgetMode,
+    /// Why the walk stopped early, if it did.
+    pub stopped_early: Option<StopReason>,
 }
 
 /// Format a list of entries as a SIF document string.
@@ -103,7 +114,45 @@ pub fn write_sif_with(entries: &[Entry], opts: &SifOptions, w: &mut dyn Write) -
     }
 
     if let Some(budget) = &opts.summary {
-        write_summary(entries, budget, opts.no_stat, w)?;
+        write_summary(entries, budget, &opts.budget_skipped, opts.no_stat, w)?;
+    }
+    if !opts.budget_skipped.is_empty() {
+        write_skipped(&opts.budget_skipped, opts.no_stat, w)?;
+    }
+    Ok(())
+}
+
+/// The §skipped section: matches a --fit budget left out, largest first.
+fn write_skipped(skipped: &[Entry], no_stat: bool, w: &mut dyn Write) -> std::fmt::Result {
+    let mut by_size: Vec<&Entry> = skipped.iter().collect();
+    by_size.sort_by(|a, b| b.tokens_est.cmp(&a.tokens_est).then(a.path.cmp(&b.path)));
+    let shown = by_size.len().min(MAX_SKIPPED_LISTED);
+
+    writeln!(w, "---")?;
+    writeln!(w, "§skipped")?;
+    writeln!(
+        w,
+        "#context Matched but left out to fit the budget, largest first ({} of {})",
+        shown,
+        by_size.len()
+    )?;
+    if no_stat {
+        writeln!(w, "#schema path:str:path kind:{}", KIND_ENUM)?;
+        for e in &by_size[..shown] {
+            writeln!(w, "{}\t{}", sif_str(&e.path.to_string_lossy()), e.kind)?;
+        }
+    } else {
+        writeln!(w, "#schema path:str:path size:uint kind:{} tokens_est:uint", KIND_ENUM)?;
+        for e in &by_size[..shown] {
+            writeln!(
+                w,
+                "{}\t{}\t{}\t{}",
+                sif_str(&e.path.to_string_lossy()),
+                e.size,
+                e.kind,
+                e.tokens_est
+            )?;
+        }
     }
     Ok(())
 }
@@ -111,6 +160,7 @@ pub fn write_sif_with(entries: &[Entry], opts: &SifOptions, w: &mut dyn Write) -
 fn write_summary(
     entries: &[Entry],
     budget: &BudgetInfo,
+    skipped: &[Entry],
     no_stat: bool,
     w: &mut dyn Write,
 ) -> std::fmt::Result {
@@ -140,6 +190,16 @@ fn write_summary(
     if let Some(b) = budget.byte_budget {
         writeln!(w, "byte_budget\t{}", b)?;
         writeln!(w, "byte_budget_remaining\t{}", b.saturating_sub(total_bytes))?;
+    }
+    let has_budget = budget.token_budget.is_some() || budget.byte_budget.is_some();
+    if has_budget && budget.budget_mode == BudgetMode::Fit {
+        writeln!(w, "budget_mode\tfit")?;
+        writeln!(w, "budget_skipped_files\t{}", skipped.len())?;
+        writeln!(w, "budget_skipped_tokens_est\t{}", skipped.iter().map(|e| e.tokens_est).sum::<u64>())?;
+        writeln!(w, "budget_skipped_bytes\t{}", skipped.iter().map(|e| e.size).sum::<u64>())?;
+    }
+    if let Some(reason) = budget.stopped_early {
+        writeln!(w, "stopped_early\t{}", reason.as_str())?;
     }
     if budget.unreadable_dirs > 0 {
         writeln!(w, "unreadable_dirs\t{}", budget.unreadable_dirs)?;
@@ -267,7 +327,7 @@ mod tests {
 
     #[test]
     fn no_stat_schema_is_explicit() {
-        let sif = to_sif_with(&sample_entries(), &SifOptions { no_stat: true, summary: None });
+        let sif = to_sif_with(&sample_entries(), &SifOptions { no_stat: true, ..SifOptions::default() });
         assert!(sif.contains("#schema path:str:path kind:"));
         assert!(sif.contains("src/main.rs\tsource\tfalse"));
     }

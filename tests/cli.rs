@@ -489,3 +489,64 @@ fn git_files_errors() {
     let out = globber(dir.path(), &["**", "--git-files", "-d"]);
     assert_eq!(out.status.code(), Some(2));
 }
+
+// ── Budget reporting ────────────────────────────────────────────────
+
+fn fit_tree() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "Sources/App.swift", &"a".repeat(3500)); // 1000 tokens
+    write(dir.path(), "Sources/Conversation.swift", &"a".repeat(70_000)); // 20000
+    write(dir.path(), "Sources/Message.swift", &"a".repeat(3500));
+    write(dir.path(), "Sources/Zebra.swift", &"a".repeat(35_000)); // 10000
+    dir
+}
+
+#[test]
+fn fit_reports_holes_in_summary_and_skipped_section() {
+    let dir = fit_tree();
+    let out = stdout(&globber(dir.path(), &["Sources/*.swift", "-t", "5K", "--fit", "-S"]));
+    assert!(out.contains("budget_mode\tfit\n"), "{}", out);
+    assert!(out.contains("budget_skipped_files\t2\n"));
+    assert!(out.contains("budget_skipped_tokens_est\t30000\n"));
+    assert!(!out.contains("stopped_early"));
+    // Largest first.
+    let skipped = &out[out.find("§skipped").expect("§skipped section")..];
+    let conv = skipped.find("Sources/Conversation.swift\t").unwrap();
+    let zebra = skipped.find("Sources/Zebra.swift\t").unwrap();
+    assert!(conv < zebra);
+    assert!(skipped.contains("(2 of 2)"));
+}
+
+#[test]
+fn fit_skipped_section_without_summary_and_stderr_with_paths() {
+    let dir = fit_tree();
+    let out = stdout(&globber(dir.path(), &["Sources/*.swift", "-t", "5K", "--fit"]));
+    assert!(out.contains("§skipped"));
+    assert!(!out.contains("§summary"));
+    let out = globber(dir.path(), &["Sources/*.swift", "-t", "5K", "--fit", "-p"]);
+    assert_eq!(lines(&out), vec!["Sources/App.swift", "Sources/Message.swift"]);
+    assert!(stderr(&out).contains("left out 2 matching file(s)"));
+    assert!(stderr(&out).contains("Sources/Conversation.swift"));
+}
+
+#[test]
+fn fit_with_nothing_skipped_says_zero() {
+    let dir = fit_tree();
+    let out = stdout(&globber(dir.path(), &["Sources/*.swift", "-t", "1M", "--fit", "-S"]));
+    assert!(out.contains("budget_skipped_files\t0\n"));
+    assert!(!out.contains("§skipped"));
+}
+
+#[test]
+fn stop_and_limit_report_stopped_early() {
+    let dir = fit_tree();
+    let out = stdout(&globber(dir.path(), &["Sources/*.swift", "-t", "5K", "-S"]));
+    assert!(out.contains("stopped_early\ttoken_budget\n"));
+    assert!(!out.contains("budget_mode"));
+    let out = stdout(&globber(dir.path(), &["Sources/*.swift", "--byte-budget", "5K", "-S"]));
+    assert!(out.contains("stopped_early\tbyte_budget\n"));
+    let out = stdout(&globber(dir.path(), &["Sources/*.swift", "-n", "1", "-S"]));
+    assert!(out.contains("stopped_early\tlimit\n"));
+    let out = stdout(&globber(dir.path(), &["Sources/*.swift", "-S"]));
+    assert!(!out.contains("stopped_early"));
+}

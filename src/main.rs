@@ -443,10 +443,10 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
         ..WalkOptions::default()
     };
 
-    let results = globber::walk_many(&patterns, opts).map_err(|e| e.to_string())?;
-    let mut entries: Vec<Entry> = Vec::with_capacity(results.len());
+    let report = globber::walk_many_report(&patterns, opts).map_err(|e| e.to_string())?;
+    let mut entries: Vec<Entry> = Vec::with_capacity(report.results.len());
     let mut errors = Vec::new();
-    for r in results {
+    for r in report.results {
         match r {
             Ok(e) => entries.push(e),
             Err(e) => errors.push(e),
@@ -460,6 +460,18 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
         eprintln!("warning: skipped unreadable directory: {}{}", first, more);
     }
 
+    // A --fit skip leaves a hole in the middle of the sorted results; say so
+    // wherever the SIF §skipped section won't be seen.
+    if !report.budget_skipped.is_empty() && ga.format == OutputFormat::Paths {
+        let largest = report.budget_skipped.iter().max_by_key(|e| e.tokens_est).unwrap();
+        eprintln!(
+            "note: --fit left out {} matching file(s) over budget, largest: {} (~{} tokens)",
+            report.budget_skipped.len(),
+            largest.path.display(),
+            largest.tokens_est
+        );
+    }
+
     let output = match ga.format {
         OutputFormat::Paths => to_paths(&entries),
         OutputFormat::Sif => {
@@ -468,8 +480,15 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
                 byte_budget: ga.byte_budget,
                 wall_time_ms: t0.elapsed().as_millis() as u64,
                 unreadable_dirs: errors.len(),
+                budget_mode: if ga.fit { BudgetMode::Fit } else { BudgetMode::Stop },
+                stopped_early: report.stopped_early,
             });
-            let mut out = to_sif_with(&entries, &SifOptions { no_stat: ga.no_stat, summary });
+            let sif_opts = SifOptions {
+                no_stat: ga.no_stat,
+                summary,
+                budget_skipped: report.budget_skipped,
+            };
+            let mut out = to_sif_with(&entries, &sif_opts);
             if let Some(ref mode) = ga.preview {
                 globber::write_preview(&entries, mode, &mut out).map_err(|e| e.to_string())?;
             }
@@ -618,8 +637,10 @@ OPTIONS
 
   -S, --summary
       Append a §summary section: total files, dirs, bytes, estimated
-      tokens, kind breakdown, wall time, and budget remaining (if a
-      budget was set), and unreadable directories. SIF output only.
+      tokens, kind breakdown, wall time, budget remaining (if a budget
+      was set), what --fit skipped, stopped_early (limit, token_budget or
+      byte_budget) if the walk was cut short — more matches may exist —
+      and unreadable directories. SIF output only.
 
   -P, --preview <SPEC>
       Append a §preview section with an excerpt of each matched text file.
@@ -709,7 +730,10 @@ OPTIONS
   --fit
       With a budget: instead of stopping at the first result that doesn't
       fit, skip it and keep going, packing as many results as fit (in
-      sorted order). Walks the whole tree.
+      sorted order). Walks the whole tree. Skipped files leave holes in
+      the sorted listing, so they are always reported: a §skipped section
+      lists the 50 largest (with --paths, a note on stderr), and -S adds
+      budget_skipped_files / _tokens_est / _bytes.
 
   -k, --kind <KIND,...>
       Only yield files of the given kind(s). Comma-separated: source, test,

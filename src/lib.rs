@@ -115,7 +115,10 @@ pub use error::{GlobError, PatternError, PatternErrorKind};
 pub use pattern::{Pattern, expand_braces, try_expand_braces, MAX_BRACE_EXPANSIONS};
 pub use matcher::MatchOptions;
 pub use entry::{Entry, FileKind};
-pub use walker::{BudgetMode, EntryFilter, WalkOptions, WalkResult, walk, walk_many};
+pub use walker::{
+    BudgetMode, EntryFilter, StopReason, WalkOptions, WalkReport, WalkResult, walk, walk_many,
+    walk_many_report,
+};
 pub use ruleset::Ruleset;
 pub use sif_output::{
     to_paths, to_sif, to_sif_with, to_sif_with_summary, to_sif_with_summary_and_budget, write_sif,

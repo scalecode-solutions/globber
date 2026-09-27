@@ -147,6 +147,41 @@ pub fn walk_pattern(pat: &Pattern, opts: WalkOptions) -> Result<Vec<WalkResult>,
     walk(pat.as_str(), opts)
 }
 
+/// Why a walk stopped before examining every candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// `limit` results were collected; more matches may exist.
+    Limit,
+    /// The next match would have exceeded `token_budget` (BudgetMode::Stop).
+    TokenBudget,
+    /// The next match would have exceeded `byte_budget` (BudgetMode::Stop).
+    ByteBudget,
+}
+
+impl StopReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StopReason::Limit => "limit",
+            StopReason::TokenBudget => "token_budget",
+            StopReason::ByteBudget => "byte_budget",
+        }
+    }
+}
+
+/// The full outcome of a walk: results plus what was left out and why.
+#[derive(Debug)]
+pub struct WalkReport {
+    /// Matched entries and I/O errors, in order.
+    pub results: Vec<WalkResult>,
+    /// Matches left out because they didn't fit a budget
+    /// (BudgetMode::Fit), in walk order. Unlike a stop, these leave holes
+    /// in the middle of the sorted results.
+    pub budget_skipped: Vec<Entry>,
+    /// Set if the walk stopped early; matches after that point were not
+    /// examined.
+    pub stopped_early: Option<StopReason>,
+}
+
 /// Walk the filesystem matching any of several patterns in a single pass.
 ///
 /// Each path is yielded at most once, even if several patterns match it.
@@ -154,6 +189,16 @@ pub fn walk_many<S: AsRef<str>>(
     patterns: &[S],
     opts: WalkOptions,
 ) -> Result<Vec<WalkResult>, GlobError> {
+    walk_many_report(patterns, opts).map(|r| r.results)
+}
+
+/// Like [`walk_many`], but also reports entries skipped for budget and
+/// whether the walk stopped early — so callers can tell a complete result
+/// from a partial one.
+pub fn walk_many_report<S: AsRef<str>>(
+    patterns: &[S],
+    opts: WalkOptions,
+) -> Result<WalkReport, GlobError> {
     // Expand braces, compile, and group patterns by their root ("", "/", ...).
     let mut groups: Vec<(PathBuf, Vec<Compiled>)> = Vec::new();
     for p in patterns {
@@ -181,7 +226,7 @@ pub fn walk_many<S: AsRef<str>>(
         }
     }
 
-    let mut results = sink.results;
+    let mut results = std::mem::take(&mut sink.results);
     // In git_files mode a failed listing means the answer is unknown, not
     // partial: report it rather than returning what was found elsewhere.
     if let Some(pos) = results.iter().position(|r| matches!(r, Err(GlobError::Git { .. }))) {
@@ -198,7 +243,11 @@ pub fn walk_many<S: AsRef<str>>(
             return Err(results.swap_remove(pos).unwrap_err());
         }
     }
-    Ok(results)
+    Ok(WalkReport {
+        results,
+        budget_skipped: sink.budget_skipped,
+        stopped_early: sink.stopped_early,
+    })
 }
 
 fn result_path(r: &WalkResult) -> &Path {
@@ -296,6 +345,8 @@ struct Sink {
     bytes: u64,
     tokens: u64,
     stopped: bool,
+    stopped_early: Option<StopReason>,
+    budget_skipped: Vec<Entry>,
 }
 
 impl Sink {
@@ -311,6 +362,8 @@ impl Sink {
             bytes: 0,
             tokens: 0,
             stopped: false,
+            stopped_early: None,
+            budget_skipped: Vec::new(),
         }
     }
 
@@ -327,6 +380,8 @@ impl Sink {
             bytes: 0,
             tokens: 0,
             stopped: false,
+            stopped_early: None,
+            budget_skipped: Vec::new(),
         }
     }
 
@@ -339,8 +394,16 @@ impl Sink {
             .token_budget
             .is_some_and(|b| self.tokens + entry.tokens_est > b);
         if over_bytes || over_tokens {
-            if self.mode == BudgetMode::Stop {
-                self.stopped = true;
+            match self.mode {
+                BudgetMode::Stop => {
+                    self.stopped = true;
+                    self.stopped_early = Some(if over_tokens {
+                        StopReason::TokenBudget
+                    } else {
+                        StopReason::ByteBudget
+                    });
+                }
+                BudgetMode::Fit => self.budget_skipped.push(entry),
             }
             return;
         }
@@ -350,6 +413,7 @@ impl Sink {
         self.results.push(Ok(entry));
         if self.limit.is_some_and(|l| self.count >= l) {
             self.stopped = true;
+            self.stopped_early = Some(StopReason::Limit);
         }
     }
 
@@ -366,6 +430,7 @@ impl Sink {
     fn absorb(&mut self, other: Sink) {
         self.results.extend(other.results);
         self.stopped |= other.stopped;
+        self.budget_skipped.extend(other.budget_skipped);
     }
 }
 
