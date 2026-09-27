@@ -64,7 +64,7 @@ impl Pattern {
 
     /// Test whether a `Path` matches this pattern.
     pub fn matches_path(&self, path: &std::path::Path) -> bool {
-        path.to_str().map_or(false, |s| self.matches(s))
+        path.to_str().is_some_and(|s| self.matches(s))
     }
 
     /// Test whether a `Path` matches this pattern with options.
@@ -73,7 +73,7 @@ impl Pattern {
         path: &std::path::Path,
         opts: MatchOptions,
     ) -> bool {
-        path.to_str().map_or(false, |s| self.matches_with(s, opts))
+        path.to_str().is_some_and(|s| self.matches_with(s, opts))
     }
 }
 
@@ -97,7 +97,7 @@ fn nfa_match(tokens: &[Token], input: &str, opts: MatchOptions) -> bool {
     let mut next: Vec<(usize, bool)> = Vec::with_capacity(tokens.len() + 1);
 
     // Seed: start at token 0, follows_separator = true (start of path).
-    add_state(&mut current, tokens, 0, true, opts);
+    add_state(&mut current, tokens, 0, true);
 
     for c in input.chars() {
         next.clear();
@@ -126,7 +126,7 @@ fn nfa_match(tokens: &[Token], input: &str, opts: MatchOptions) -> bool {
                         continue;
                     }
                     // Consume c, stay in AnySequence state.
-                    add_state(&mut next, tokens, ti, is_sep, opts);
+                    add_state(&mut next, tokens, ti, is_sep);
                 }
                 Token::AnyRecursiveSequence => {
                     // **: match any character, including separators.
@@ -138,7 +138,7 @@ fn nfa_match(tokens: &[Token], input: &str, opts: MatchOptions) -> bool {
                     }
                     // Consume c, stay in ** state.
                     // is_sep tells add_state whether we're at a boundary.
-                    add_state(&mut next, tokens, ti, is_sep, opts);
+                    add_state(&mut next, tokens, ti, is_sep);
                 }
                 Token::AnyChar => {
                     if follows_sep && opts.require_literal_leading_dot && c == '.' {
@@ -148,7 +148,7 @@ fn nfa_match(tokens: &[Token], input: &str, opts: MatchOptions) -> bool {
                         continue;
                     }
                     // Consume c, advance to next token.
-                    add_state(&mut next, tokens, ti + 1, is_sep, opts);
+                    add_state(&mut next, tokens, ti + 1, is_sep);
                 }
                 Token::AnyWithin(specs) => {
                     if follows_sep && opts.require_literal_leading_dot && c == '.' {
@@ -158,7 +158,7 @@ fn nfa_match(tokens: &[Token], input: &str, opts: MatchOptions) -> bool {
                         continue;
                     }
                     if specs.iter().any(|s| s.matches(c, opts.case_sensitive)) {
-                        add_state(&mut next, tokens, ti + 1, is_sep, opts);
+                        add_state(&mut next, tokens, ti + 1, is_sep);
                     }
                 }
                 Token::AnyExcept(specs) => {
@@ -169,12 +169,12 @@ fn nfa_match(tokens: &[Token], input: &str, opts: MatchOptions) -> bool {
                         continue;
                     }
                     if !specs.iter().any(|s| s.matches(c, opts.case_sensitive)) {
-                        add_state(&mut next, tokens, ti + 1, is_sep, opts);
+                        add_state(&mut next, tokens, ti + 1, is_sep);
                     }
                 }
                 Token::Char(expected) => {
                     if chars_eq(c, *expected, opts.case_sensitive) {
-                        add_state(&mut next, tokens, ti + 1, is_sep, opts);
+                        add_state(&mut next, tokens, ti + 1, is_sep);
                     }
                 }
             }
@@ -203,13 +203,7 @@ fn nfa_match(tokens: &[Token], input: &str, opts: MatchOptions) -> bool {
 /// When we reach a `*` or `**` token, we can epsilon-transition to
 /// the next token (the wildcard matches empty string). We follow
 /// these chains eagerly.
-fn add_state(
-    states: &mut Vec<(usize, bool)>,
-    tokens: &[Token],
-    ti: usize,
-    follows_sep: bool,
-    opts: MatchOptions,
-) {
+fn add_state(states: &mut Vec<(usize, bool)>, tokens: &[Token], ti: usize, follows_sep: bool) {
     // Avoid duplicates.
     let entry = (ti, follows_sep);
     if states.contains(&entry) {
@@ -225,15 +219,13 @@ fn add_state(
     match &tokens[ti] {
         Token::AnySequence => {
             // * can always epsilon to next token (match empty).
-            add_state(states, tokens, ti + 1, follows_sep, opts);
+            add_state(states, tokens, ti + 1, follows_sep);
         }
-        Token::AnyRecursiveSequence => {
-            // ** can only start the next sub-pattern at a component boundary.
-            // It epsilon-transitions to the next token only when follows_sep
-            // is true (at start of input or right after a `/`).
-            if follows_sep {
-                add_state(states, tokens, ti + 1, follows_sep, opts);
-            }
+        // ** can only start the next sub-pattern at a component boundary:
+        // it epsilon-transitions to the next token only when follows_sep
+        // is true (at start of input or right after a `/`).
+        Token::AnyRecursiveSequence if follows_sep => {
+            add_state(states, tokens, ti + 1, follows_sep);
         }
         _ => {}
     }

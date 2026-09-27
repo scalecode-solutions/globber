@@ -295,7 +295,7 @@ impl Entry {
     /// Build a lightweight Entry from a DirEntry (avoids extra syscall on Linux).
     pub(crate) fn from_dir_entry(path: PathBuf, de: &fs::DirEntry) -> Self {
         let ft = de.file_type().ok();
-        let is_symlink = ft.as_ref().map_or(false, |f| f.is_symlink());
+        let is_symlink = ft.as_ref().is_some_and(|f| f.is_symlink());
 
         // On Linux, DirEntry gives us file_type for free from readdir.
         // For symlinks or if file_type is unavailable, fall back to stat.
@@ -307,7 +307,7 @@ impl Entry {
 
         let (size, is_dir, modified) = match meta {
             Some(m) => (m.len(), m.is_dir(), m.modified().ok()),
-            None => (0, ft.as_ref().map_or(false, |f| f.is_dir()), None),
+            None => (0, ft.as_ref().is_some_and(|f| f.is_dir()), None),
         };
 
         let kind = if is_dir {
@@ -332,10 +332,10 @@ impl Entry {
     /// (free on Linux) and estimates tokens from extension heuristics.
     pub(crate) fn from_dir_entry_lightweight(path: PathBuf, de: &fs::DirEntry) -> Self {
         let ft = de.file_type().ok();
-        let is_dir = ft.as_ref().map_or(false, |f| {
-            f.is_dir() || (f.is_symlink() && fs::metadata(&path).map_or(false, |m| m.is_dir()))
+        let is_dir = ft.as_ref().is_some_and(|f| {
+            f.is_dir() || (f.is_symlink() && fs::metadata(&path).is_ok_and(|m| m.is_dir()))
         });
-        let is_symlink = ft.as_ref().map_or(false, |f| f.is_symlink());
+        let is_symlink = ft.as_ref().is_some_and(|f| f.is_symlink());
         let kind = if is_dir { FileKind::Unknown } else { FileKind::infer(&path) };
         let tokens_est = if is_dir { 0 } else { estimate_tokens_by_extension(&path) };
 
@@ -365,7 +365,7 @@ impl Entry {
 
     /// Build an Entry from a path with minimal stat — just enough to know if it's a dir.
     pub(crate) fn from_path_lightweight(path: PathBuf) -> Self {
-        let is_dir = fs::metadata(&path).map_or(false, |m| m.is_dir());
+        let is_dir = fs::metadata(&path).is_ok_and(|m| m.is_dir());
         let kind = if is_dir { FileKind::Unknown } else { FileKind::infer(&path) };
         let tokens_est = if is_dir { 0 } else { estimate_tokens_by_extension(&path) };
 

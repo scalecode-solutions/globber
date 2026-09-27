@@ -11,19 +11,21 @@ A ground-up Rust rewrite of Unix glob, rooted in the POSIX `glob(3)` and `fnmatc
 | Matching engine | Recursive backtracking O(2^n) | Thompson NFA O(n*m) |
 | Output | `PathBuf` | `Entry` (path + size + kind + tokens_est) |
 | Format | Rust iterator | SIF v1 document or plain paths |
-| Patterns | Single | Single, multi-pattern `Ruleset`, or brace expansion |
-| Negation | None | `--exclude`, `--gitignore`, `Ruleset::exclude()` |
-| Budget | None | `--token-budget`, `--byte-budget`, `--limit` |
-| Classification | None | `FileKind` (source, test, config, generated, ...) |
-| Parallelism | None | rayon — parallel readdir + stat |
-| Preview | None | `--preview code:15` — skip preamble, show code |
-| Git | None | `--git-changed main` — only modified files |
+| Patterns | Single | Many patterns and brace alternatives in **one** walk, deduplicated |
+| Negation | None | `--exclude`, `--gitignore` (full gitignore semantics), `Ruleset::exclude()` |
+| Budget | None | `--token-budget`, `--byte-budget`, `--limit`, `--fit` packing |
+| Classification | None | `FileKind` (source, test, config, build, doc, data, generated, binary) |
+| Parallelism | None | rayon — parallel readdir + stat, identical output to the sequential walk |
+| Preview | None | `--preview code:15` — skip the preamble, show code |
+| Git | None | `--git-changed main` — only what this branch changed |
 
 ## Install
 
 ```sh
-cargo install globber
+cargo install globber-ai
 ```
+
+The crate is `globber-ai`; the binary and library are both `globber`.
 
 ## Quick start
 
@@ -31,20 +33,25 @@ cargo install globber
 # Scope a project — files, sizes, token estimates, code previews, summary
 globber '**/*.rs' -g -k source -P code:15 -S
 
-# Budget-aware context packing for LLMs
+# Budget-aware context packing for LLMs (stop at 80K, or --fit to pack)
 globber '**/*.{rs,go,py}' -g -t 80K -S
+globber '**/*.{rs,go,py}' -g -t 80K --fit -S
 
-# Files changed since main branch
+# Files this branch changed relative to main
 globber '**/*.rs' -G main -P code:10
 
-# Plain paths, gitignore-aware
-globber '**' -g -k source -p
+# Plain paths, gitignore-aware, skipping generated code
+globber '**' -g -k source -e '**/generated/**' -p
 ```
+
+Limits never take `0`: `-n`, `-t`, `--byte-budget` and `--depth` require a
+positive value, or `unlimited` to remove a cap explicitly. See
+`globber --help` for the full reference.
 
 ## Library usage
 
 ```rust
-use globber::{Pattern, glob, Ruleset, MatchOptions};
+use globber::{Pattern, glob, walk_many, Ruleset, WalkOptions};
 
 // Pure pattern matching (POSIX fnmatch equivalent)
 let pat = Pattern::new("*.rs").unwrap();
@@ -57,6 +64,10 @@ for entry in glob("src/**/*.rs").unwrap() {
     }
 }
 
+// Several patterns, one walk, with a budget
+let opts = WalkOptions { token_budget: Some(80_000), ..WalkOptions::default() };
+let results = walk_many(&["src/**/*.rs", "Cargo.toml"], opts).unwrap();
+
 // Multi-pattern ruleset with priorities
 let rules = Ruleset::new()
     .include("src/**/*.rs")
@@ -68,14 +79,25 @@ assert!(rules.is_match("src/main.rs"));
 
 ## SIF output
 
-Default output is a [SIF v1](https://github.com/scalecode-solutions/sif-parser) document:
+Default output is a [SIF v1](https://github.com/scalecode-solutions/sif-parser) document (records are tab-separated):
 
 ```
 #!sif v1
 #context File listing produced by globber
-#schema path:str:path	size:uint	kind:str:311	tokens_est:uint	is_dir:bool
-src/main.rs	1024	source	293	false
+#schema path:str:path size:uint kind:enum(source,test,config,build,doc,data,generated,binary,unknown) tokens_est:uint is_dir:bool
 src/lib.rs	856	source	245	false
+src/main.rs	1024	source	293	false
+```
+
+Previews are SIF code blocks:
+
+```
+---
+§preview
+#block code language=rust file=src/main.rs lines=3-12
+use std::env;
+...
+#/block
 ```
 
 Part of the SIF ecosystem: `sif-parser`, `sif-scratch`, STP, SWT, SIL.

@@ -1,6 +1,6 @@
 [package]
 name = "globber-ai"
-version = "0.6.9"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.85"
 description = "AI-native glob — POSIX-rooted pattern matching with SIF output, budget-aware walking, multi-pattern rulesets, and linear-time matching"

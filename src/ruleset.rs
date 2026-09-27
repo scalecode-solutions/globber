@@ -122,6 +122,7 @@ impl RulesetBuilder {
 
 impl Ruleset {
     /// Start building a new ruleset.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new() -> RulesetBuilder {
         RulesetBuilder {
             entries: Vec::new(),
