@@ -13,6 +13,7 @@ use std::path::Path;
 
 use crate::entry::{Entry, FileKind};
 use crate::error::GlobError;
+use crate::ignore::IgnoreFile;
 use crate::matcher::MatchOptions;
 use crate::pattern::Pattern;
 use crate::walker::WalkOptions;
@@ -51,12 +52,14 @@ enum RuleKind {
 pub struct Ruleset {
     rules: Vec<Rule>,
     match_opts: MatchOptions,
+    ignores: Vec<IgnoreFile>,
 }
 
 /// Builder for constructing a Ruleset.
 pub struct RulesetBuilder {
     entries: Vec<(String, RuleKind, f32)>,
     match_opts: MatchOptions,
+    ignores: Vec<IgnoreFile>,
 }
 
 impl RulesetBuilder {
@@ -85,38 +88,15 @@ impl RulesetBuilder {
         self
     }
 
-    /// Load .gitignore rules from a file as exclude patterns.
-    pub fn gitignore(self, path: &Path) -> Self {
-        self.gitignore_from(path)
-    }
-
-    /// Load .gitignore-style rules from a file.
-    fn gitignore_from(mut self, path: &Path) -> Self {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some(negated) = line.strip_prefix('!') {
-                    // Negation in gitignore = include.
-                    let pattern = if negated.contains('/') {
-                        negated.to_string()
-                    } else {
-                        format!("**/{}", negated)
-                    };
-                    self.entries
-                        .push((pattern, RuleKind::Include, 1.0));
-                } else {
-                    let pattern = if line.contains('/') {
-                        line.to_string()
-                    } else {
-                        format!("**/{}", line)
-                    };
-                    self.entries
-                        .push((pattern, RuleKind::Exclude, 0.0));
-                }
-            }
+    /// Also exclude paths ignored by a .gitignore file, using full
+    /// gitignore semantics (anchoring, `dir/` rules, negation, ignored
+    /// parent directories). Its rules apply to paths under the file's
+    /// directory, spelled the same way as the paths later passed to
+    /// [`Ruleset::is_match`] (e.g. `.gitignore` for relative paths).
+    pub fn gitignore(mut self, path: &Path) -> Self {
+        let anchor = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        if let Some(file) = IgnoreFile::load(path, anchor) {
+            self.ignores.push(file);
         }
         self
     }
@@ -135,6 +115,7 @@ impl RulesetBuilder {
         Ok(Ruleset {
             rules,
             match_opts: self.match_opts,
+            ignores: self.ignores,
         })
     }
 }
@@ -145,6 +126,7 @@ impl Ruleset {
         RulesetBuilder {
             entries: Vec::new(),
             match_opts: MatchOptions::new(),
+            ignores: Vec::new(),
         }
     }
 
@@ -169,7 +151,11 @@ impl Ruleset {
             }
         }
 
-        included && !dominated
+        included && !dominated && !self.is_ignored(path)
+    }
+
+    fn is_ignored(&self, path: &str) -> bool {
+        !self.ignores.is_empty() && IgnoreFile::is_path_ignored(&self.ignores, Path::new(path), false)
     }
 
     /// Compute a relevance score for a path.
@@ -193,7 +179,7 @@ impl Ruleset {
             }
         }
 
-        if excluded {
+        if excluded || self.is_ignored(path) {
             0.0
         } else {
             score
@@ -308,6 +294,21 @@ mod tests {
         assert!(rs.relevance("src/core/lib.rs") > rs.relevance("tests/unit.rs"));
         assert_eq!(rs.relevance("target/debug/main.rs"), 0.0);
         assert_eq!(rs.relevance("README.md"), 0.0);
+    }
+
+    #[test]
+    fn gitignore_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let gi = dir.path().join(".gitignore");
+        std::fs::write(&gi, "/target\n*.log\n!keep.log\nbuild/\n").unwrap();
+        let root = dir.path().display();
+        let rs = Ruleset::new().include("**").gitignore(&gi).build().unwrap();
+        assert!(rs.is_match(&format!("{}/src/main.rs", root)));
+        assert!(!rs.is_match(&format!("{}/target/debug/x", root)));
+        assert!(rs.is_match(&format!("{}/src/target/x", root)));
+        assert!(!rs.is_match(&format!("{}/a.log", root)));
+        assert!(rs.is_match(&format!("{}/keep.log", root)));
+        assert!(!rs.is_match(&format!("{}/x/build/out.o", root)));
     }
 
     #[test]
