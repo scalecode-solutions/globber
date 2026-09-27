@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "globber-ai"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "rayon",
  "tempfile",
