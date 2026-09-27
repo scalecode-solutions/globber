@@ -189,6 +189,7 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
             "--follow" | "-L" => ga.follow = true,
             "--fit" => ga.fit = true,
             "--skip-nested-repos" => ga.skip_nested_repos = true,
+            "--git-files" => ga.git_files = true,
             "--dirs" | "-d" => ga.only_dirs = true,
             "--preview" | "-P" => {
                 let val = args.value(&flag, "a spec (N, N-M, or code:N)")?;
@@ -235,6 +236,9 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
 
     if ga.patterns.is_empty() {
         return Err("no patterns given".to_string());
+    }
+    if ga.git_files && ga.only_dirs {
+        return Err("--git-files lists files only; it can't be combined with --dirs".to_string());
     }
     Ok(Command::Glob(ga))
 }
@@ -432,6 +436,7 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
         gitignore: ga.gitignore,
         follow_symlinks: ga.follow,
         skip_nested_repos: ga.skip_nested_repos,
+        git_files: ga.git_files,
         budget_mode: if ga.fit { BudgetMode::Fit } else { BudgetMode::Stop },
         exclude,
         filter,
@@ -668,8 +673,18 @@ OPTIONS
       ignore rule are skipped (a walk can't see git's index); use
       --git-files for git's exact view.
 
+  --git-files
+      Take the file list from git instead of reading directories: exactly
+      the files git considers part of the working tree (git ls-files
+      --cached --others --exclude-standard), including tracked files that
+      match an ignore rule, and recursing into submodules and nested
+      repositories. Patterns, -e, -k, -G, limits and budgets apply as
+      usual. Yields files only (no directories); -g and -L are implied /
+      irrelevant. Often faster than a walk on large repositories.
+
   --skip-nested-repos
-      Don't descend into nested repositories or submodules below the root.
+      Don't descend into nested repositories or submodules below the root
+      (with --git-files: don't list their files).
 
   -G, --git-changed [REF]
       Only include files changed since REF: committed, staged, unstaged,
@@ -740,6 +755,7 @@ EXAMPLES
   Filtering:
     globber '**/*.rs' -e target -e '**/gen/**'  Manual excludes
     globber '**' -g -k source -p                Plain paths, gitignore-aware
+    globber '**/*.rs' --git-files -p            Exactly git's view of the repo
     globber '**/*.rs' --no-stat -p              Fast listing without metadata
 
 SIF OUTPUT

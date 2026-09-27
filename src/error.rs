@@ -58,6 +58,8 @@ pub enum GlobError {
     Pattern(PatternError),
     /// An I/O error while reading a directory.
     Io { path: std::path::PathBuf, error: io::Error },
+    /// Listing files with git failed (e.g. not a git repository).
+    Git { path: std::path::PathBuf, message: String },
 }
 
 impl fmt::Display for GlobError {
@@ -67,6 +69,7 @@ impl fmt::Display for GlobError {
             GlobError::Io { path, error } => {
                 write!(f, "reading `{}`: {}", path.display(), error)
             }
+            GlobError::Git { message, .. } => write!(f, "{}", message),
         }
     }
 }
@@ -76,6 +79,7 @@ impl std::error::Error for GlobError {
         match self {
             GlobError::Pattern(e) => Some(e),
             GlobError::Io { error, .. } => Some(error),
+            GlobError::Git { .. } => None,
         }
     }
 }

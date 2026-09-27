@@ -72,6 +72,72 @@ pub fn changed_files(root: &Path, ref_name: &str) -> Result<Vec<PathBuf>, String
     Ok(paths)
 }
 
+/// The files git considers part of the working tree under `dir`: tracked
+/// files (even ones matching an ignore rule) plus untracked files that are
+/// not ignored — `git ls-files --cached --others --exclude-standard`.
+/// Paths are relative to `dir`. With `nested`, recurses into initialized
+/// submodules and untracked nested repositories.
+pub fn repo_files(dir: &Path, nested: bool) -> Result<Vec<PathBuf>, String> {
+    let listing = git(dir, &["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+        .map_err(|e| {
+            if e.contains("not a git repository") {
+                format!("not a git repository: {}", dir.display())
+            } else {
+                e
+            }
+        })?;
+    let submodules = submodule_paths(dir);
+
+    let mut files = Vec::new();
+    let mut nested_dirs = Vec::new();
+    for p in listing.split('\0').filter(|p| !p.is_empty()) {
+        if let Some(d) = p.strip_suffix('/') {
+            // Untracked nested repository: git lists it, not its contents.
+            nested_dirs.push(PathBuf::from(d));
+        } else if submodules.iter().any(|s| s == Path::new(p)) {
+            nested_dirs.push(PathBuf::from(p));
+        } else {
+            files.push(PathBuf::from(p));
+        }
+    }
+
+    if nested {
+        for d in nested_dirs {
+            let sub = dir.join(&d);
+            if sub.join(".git").exists() {
+                if let Ok(inner) = repo_files(&sub, true) {
+                    files.extend(inner.into_iter().map(|f| d.join(f)));
+                }
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Submodule paths relative to `dir`, from the repository's .gitmodules.
+fn submodule_paths(dir: &Path) -> Vec<PathBuf> {
+    let Ok(info) = git(dir, &["rev-parse", "--show-toplevel", "--show-prefix"]) else {
+        return Vec::new();
+    };
+    let mut lines = info.lines();
+    let top = PathBuf::from(lines.next().unwrap_or(""));
+    let prefix = lines.next().unwrap_or("");
+    if !top.join(".gitmodules").exists() {
+        return Vec::new();
+    }
+    let Ok(config) = git(
+        &top,
+        &["config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
+    ) else {
+        return Vec::new();
+    };
+    config
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter_map(|(_, path)| path.strip_prefix(prefix).map(PathBuf::from))
+        .collect()
+}
+
 /// Find the git repository root from a given path.
 fn find_repo_root(from: &Path) -> Result<PathBuf, String> {
     git(from, &["rev-parse", "--show-toplevel"])

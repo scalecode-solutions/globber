@@ -401,3 +401,91 @@ fn core_excludes_file_is_honored() {
     assert!(!got.contains(&"notes.txt".to_string()), "{:?}", got);
     assert!(got.contains(&"README.md".to_string()));
 }
+
+// ── --git-files ─────────────────────────────────────────────────────
+
+fn git_project() -> tempfile::TempDir {
+    let dir = project();
+    let d = dir.path();
+    git(d, &["init", "-q"]);
+    write(d, "logs/tracked.log", "x");
+    write(d, ".gitignore", "/target\ndocs/build/\n*.log\n");
+    git(d, &["add", "-A"]);
+    git(d, &["add", "-f", "logs/tracked.log"]);
+    git(d, &["commit", "-qm", "init"]);
+    write(d, "logs/untracked.log", "x"); // ignored, untracked
+    write(d, "src/fresh.rs", "fn f() {}\n"); // untracked, not ignored
+    fs::remove_file(d.join("src/util/helpers.rs")).unwrap(); // tracked, deleted
+    // An untracked nested repository.
+    write(d, "nested/inner.rs", "x");
+    git(&d.join("nested"), &["init", "-q"]);
+    dir
+}
+
+#[test]
+fn git_files_is_gits_view() {
+    let dir = git_project();
+    let out = globber(dir.path(), &["**", "--git-files", "-p"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        lines(&out),
+        vec![
+            "Cargo.toml",
+            "README.md",
+            "docs/guide.md",
+            "logs/tracked.log",
+            "nested/inner.rs",
+            "notes.txt",
+            "src/fresh.rs",
+            "src/lib.rs",
+            "src/main.rs",
+            "src/target/keep.rs",
+        ]
+    );
+}
+
+#[test]
+fn git_files_with_patterns_filters_and_limits() {
+    let dir = git_project();
+    let d = dir.path();
+    assert_eq!(
+        lines(&globber(d, &["src/**/*.rs", "--git-files", "-p"])),
+        vec!["src/fresh.rs", "src/lib.rs", "src/main.rs", "src/target/keep.rs"]
+    );
+    assert_eq!(
+        lines(&globber(d, &["**/*.rs", "--git-files", "-e", "target", "-n", "2", "-p"])),
+        vec!["nested/inner.rs", "src/fresh.rs"]
+    );
+    assert_eq!(
+        lines(&globber(d, &["**", "--git-files", "-k", "doc", "-p"])),
+        vec!["README.md", "docs/guide.md", "notes.txt"]
+    );
+    assert_eq!(
+        lines(&globber(d, &["**", "--git-files", "--depth", "1", "-p"])),
+        vec!["Cargo.toml", "README.md", "notes.txt"]
+    );
+    assert_eq!(
+        lines(&globber(d, &["**/*.rs", "--git-files", "--skip-nested-repos", "-p"])),
+        vec!["src/fresh.rs", "src/lib.rs", "src/main.rs", "src/target/keep.rs"]
+    );
+}
+
+#[test]
+fn git_files_hidden_rules_apply() {
+    let dir = git_project();
+    let d = dir.path();
+    let out = lines(&globber(d, &["**", "--git-files", "-a", "-p"]));
+    assert!(out.contains(&".gitignore".to_string()));
+    let out = lines(&globber(d, &["**", "--git-files", "-p"]));
+    assert!(!out.contains(&".gitignore".to_string()));
+}
+
+#[test]
+fn git_files_errors() {
+    let dir = project(); // not a git repository
+    let out = globber(dir.path(), &["**", "--git-files", "-p"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("not a git repository"), "{}", stderr(&out));
+    let out = globber(dir.path(), &["**", "--git-files", "-d"]);
+    assert_eq!(out.status.code(), Some(2));
+}

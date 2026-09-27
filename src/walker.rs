@@ -174,10 +174,19 @@ pub fn walk_many<S: AsRef<str>>(
             break;
         }
         let walker = Walker { opts: &opts, pats, parallel };
-        walker.walk_root(root, &mut sink);
+        if opts.git_files {
+            walker.walk_git(root, &mut sink);
+        } else {
+            walker.walk_root(root, &mut sink);
+        }
     }
 
     let mut results = sink.results;
+    // In git_files mode a failed listing means the answer is unknown, not
+    // partial: report it rather than returning what was found elsewhere.
+    if let Some(pos) = results.iter().position(|r| matches!(r, Err(GlobError::Git { .. }))) {
+        return Err(results.swap_remove(pos).unwrap_err());
+    }
     if groups.len() > 1 && opts.sorted {
         results.sort_by(|a, b| result_path(a).cmp(result_path(b)));
         results.dedup_by(|a, b| {
@@ -195,7 +204,7 @@ pub fn walk_many<S: AsRef<str>>(
 fn result_path(r: &WalkResult) -> &Path {
     match r {
         Ok(e) => &e.path,
-        Err(GlobError::Io { path, .. }) => path,
+        Err(GlobError::Io { path, .. } | GlobError::Git { path, .. }) => path,
         Err(GlobError::Pattern(_)) => Path::new(""),
     }
 }
@@ -433,6 +442,116 @@ impl Walker<'_> {
             Ancestors::default()
         };
         self.visit_dir(&scope, 0, &states, &ignores, &ancestors, sink);
+    }
+
+    /// `git_files` mode: take candidate paths from `git ls-files` in each
+    /// pattern's literal base directory, then match them component by
+    /// component with the same state machine the directory walk uses.
+    fn walk_git(&self, root: &Path, sink: &mut Sink) {
+        let scope = if root.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            root.to_path_buf()
+        };
+        let mut states = Vec::new();
+        for (p, pat) in self.pats.iter().enumerate() {
+            if !pat.comps.is_empty() {
+                self.add_state(&mut states, p, 0);
+            }
+        }
+        if states.is_empty() {
+            return;
+        }
+
+        // List each outermost literal base directory once.
+        let mut bases: Vec<PathBuf> = self
+            .pats
+            .iter()
+            .filter(|p| !p.comps.is_empty())
+            .map(|p| {
+                let n = p.prefix_len.min(p.comps.len() - 1);
+                p.comps[..n].iter().filter_map(|c| c.literal()).collect()
+            })
+            .collect();
+        bases.sort();
+        bases.dedup();
+        let mut outer: Vec<PathBuf> = Vec::new();
+        for b in bases {
+            if !outer.iter().any(|o| b.starts_with(o)) {
+                outer.push(b);
+            }
+        }
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for base in &outer {
+            let dir = base
+                .iter()
+                .fold(scope.clone(), |d, c| join(&d, &c.to_string_lossy()));
+            if !dir.is_dir() {
+                continue;
+            }
+            match crate::git::repo_files(&dir, !self.opts.skip_nested_repos) {
+                Ok(files) => candidates.extend(files.into_iter().map(|f| base.join(f))),
+                Err(message) => sink.push_err(GlobError::Git { path: dir, message }),
+            }
+        }
+
+        let mut matched: Vec<PathBuf> = candidates
+            .into_par_iter()
+            .filter_map(|rel| self.match_rel(&scope, &rel, &states))
+            .collect();
+        matched.par_sort();
+        matched.dedup();
+
+        let entry = |path: PathBuf| -> Option<Entry> {
+            // Tracked files deleted from the working tree are skipped.
+            fs::symlink_metadata(&path).ok()?;
+            let e = self.make_entry(path, None);
+            // Tracked symlinks count as files even when they point at a dir.
+            let keep = (!e.is_dir || e.is_symlink)
+                && !self.opts.only_dirs
+                && self.opts.filter.as_ref().is_none_or(|f| f.matches(&e));
+            keep.then_some(e)
+        };
+        if self.parallel {
+            let entries: Vec<Entry> = matched.into_par_iter().filter_map(entry).collect();
+            for e in entries {
+                sink.push_entry(e);
+            }
+        } else {
+            for path in matched {
+                if sink.stopped {
+                    return;
+                }
+                if let Some(e) = entry(path) {
+                    sink.push_entry(e);
+                }
+            }
+        }
+    }
+
+    /// Match a scope-relative file path against the patterns, treating
+    /// every component but the last as a directory. Returns the walk path.
+    fn match_rel(&self, scope: &Path, rel: &Path, initial: &[State]) -> Option<PathBuf> {
+        let names: Vec<&str> = rel.iter().map(|c| c.to_str()).collect::<Option<_>>()?;
+        let mut states = initial.to_vec();
+        let mut path = scope.to_path_buf();
+        for (level, name) in names.iter().enumerate() {
+            let last = level + 1 == names.len();
+            path = join(&path, name);
+            let (matched, next, _) = self.step(name, !last, level, &states);
+            if self.is_excluded(&path, name, !last) {
+                return None;
+            }
+            if last {
+                return matched.then_some(path);
+            }
+            if next.is_empty() {
+                return None;
+            }
+            states = next;
+        }
+        None
     }
 
     /// Add a state, plus the zero-component closure if it is `**`.
