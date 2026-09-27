@@ -19,6 +19,23 @@ A ground-up Rust rewrite of Unix glob, rooted in the POSIX `glob(3)` and `fnmatc
 | Preview | None | `--preview code:15` — skip the preamble, show code |
 | Git | None | `--git-changed main` (only what this branch changed), `--git-files` (exactly git's view) |
 
+## Scope
+
+glob answers *which paths match?* globber adds *what will reading them
+cost, and did I see everything?* Requests are weighed against four tenets:
+
+1. **Select and account; don't interpret.** globber chooses files and
+   reports sizes, token estimates, kinds and what it left out. Deciding
+   what a file *means* or how *important* it is belongs to other tools —
+   feed their rankings in with `--prefer-from`.
+2. **Filesystem and git's current state only.** Directory contents,
+   metadata, `.gitignore`, the index and the working tree — not commit
+   history.
+3. **Nothing disappears silently.** Every file left out by a budget,
+   limit, filter or output cap is counted or listed.
+4. **One pass, one dependency.** A single walk per invocation; rayon is
+   the only runtime dependency.
+
 ## Install
 
 ```sh
