@@ -103,6 +103,7 @@ impl Prefer {
 pub struct ScoreMap {
     scores: Arc<std::collections::HashMap<PathBuf, f64>>,
     has_absolute: bool,
+    source: Option<String>,
 }
 
 impl ScoreMap {
@@ -132,7 +133,7 @@ impl ScoreMap {
                 }
             }
         }
-        ScoreMap { scores: Arc::new(scores), has_absolute }
+        ScoreMap { scores: Arc::new(scores), has_absolute, source: None }
     }
 
     /// Parse a ranking: one entry per line, as JSON Lines
@@ -167,6 +168,18 @@ impl ScoreMap {
 
     pub fn len(&self) -> usize {
         self.scores.len()
+    }
+
+    /// Record where the scores came from (a file name, or `stdin`), for
+    /// the `prefer_from` summary line.
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// Where the scores came from, if recorded.
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
     }
 
     pub fn is_empty(&self) -> bool {

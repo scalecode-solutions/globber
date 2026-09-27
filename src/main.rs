@@ -222,7 +222,13 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
                 let val = args.value(&flag, "a number, `none` or `unlimited`")?;
                 ga.skipped_rows = match val.as_str() {
                     "none" => Some(0),
-                    _ => parse_count(&flag, &val).map_err(|e| format!("{} (or `none` to list no rows)", e))?,
+                    "0" => {
+                        return Err(format!(
+                            "{} must be at least 1 (use `unlimited` for all rows, or `none` for counts only)",
+                            flag
+                        ));
+                    }
+                    _ => parse_count(&flag, &val)?,
                 };
             }
             "--dirs" | "-d" => ga.only_dirs = true,
@@ -480,7 +486,8 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
                 std::fs::read_to_string(src).map_err(|e| format!("reading {}: {}", src, e))?
             };
             let map = globber::ScoreMap::parse(&text, root.map(std::path::Path::new))
-                .map_err(|e| format!("--prefer-from {}: {}", src, e))?;
+                .map_err(|e| format!("--prefer-from {}: {}", src, e))?
+                .with_source(if src == "-" { "stdin" } else { src.as_str() });
             Prefer::Scores(map)
         }
         (Some(p), None) => match p.as_str() {

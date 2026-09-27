@@ -678,6 +678,9 @@ fn prefer_from_all_three_formats() {
     assert!(out.contains(" score:float?\n#sort score desc\n"));
     assert!(out.contains("Sources/Zebra.swift\t35000\tsource\t10000\tfalse\t9\n"));
     assert!(out.contains("Sources/Message.swift\t3500\tsource\t1000\tfalse\t_\n"));
+    let out = stdout(&run_with_stdin(d, &["Sources/*.swift", "--prefer-from", "-", "-S"], inputs[1]));
+    assert!(out.contains("prefer\tscores\n"));
+    assert!(out.contains("prefer_from\tstdin\t2 of 4 results scored; 2 paths in the ranking\n"), "{}", out);
 }
 
 #[test]
@@ -688,6 +691,8 @@ fn prefer_from_file_and_root_relative_paths() {
     fs::write(&rank, "Message.swift\t5\n").unwrap();
     let out = globber(d, &["*.swift", "-r", "Sources", "--prefer-from", rank.to_str().unwrap(), "-n", "1", "-p"]);
     assert_eq!(lines(&out), vec!["Sources/Message.swift"]);
+    let out = stdout(&globber(d, &["*.swift", "-r", "Sources", "--prefer-from", rank.to_str().unwrap(), "-S"]));
+    assert!(out.contains(&format!("prefer_from\t{}\t1 of 4 results scored", rank.display())), "{}", out);
 }
 
 #[test]
@@ -782,6 +787,10 @@ fn skipped_rows_option() {
     let out = stdout(&globber(d, &["Sources/*.swift", "-t", "2K", "--fit", "--skipped", "none", "-S"]));
     assert!(!out.contains("§skipped"));
     assert!(out.contains("budget_skipped_files\t2\n"));
-    assert_eq!(globber(d, &["**", "--skipped", "0"]).status.code(), Some(2));
+    let out = globber(d, &["**", "--skipped", "0"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains(
+        "--skipped must be at least 1 (use `unlimited` for all rows, or `none` for counts only)"
+    ), "{}", stderr(&out));
     assert_eq!(globber(d, &["**", "--max-output-tokens", "0"]).status.code(), Some(2));
 }

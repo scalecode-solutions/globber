@@ -444,6 +444,19 @@ fn write_summary(
     }
     if let Some(p) = opts.order.as_ref().filter(|p| !matches!(p, Prefer::Path)) {
         let _ = writeln!(w, "prefer\t{}", p.as_str());
+        if let Prefer::Scores(map) = p {
+            // How many listed results got a score: 0 means the ranking's
+            // paths didn't line up with the walk's.
+            let scored = entries.iter().filter(|e| map.get(&e.path).is_some()).count();
+            let _ = writeln!(
+                w,
+                "prefer_from\t{}\t{} of {} results scored; {} paths in the ranking",
+                map.source().unwrap_or("scores"),
+                scored,
+                entries.len(),
+                map.len()
+            );
+        }
     }
     let has_budget = budget.token_budget.is_some() || budget.byte_budget.is_some();
     if has_budget && budget.budget_mode == BudgetMode::Fit {
