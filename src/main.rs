@@ -9,7 +9,7 @@ use std::env;
 use std::process;
 
 use globber::{
-    to_paths, to_sif_with, BudgetInfo, Entry, EntryFilter, FileKind, MatchOptions, PreviewMode,
+    to_paths, to_sif_with, BudgetInfo, BudgetMode, Entry, EntryFilter, FileKind, MatchOptions, PreviewMode,
     SifOptions, WalkOptions,
 };
 
@@ -49,6 +49,7 @@ struct GlobArgs {
     no_stat: bool,
     gitignore: bool,
     follow: bool,
+    fit: bool,
     preview: Option<PreviewMode>,
     git_changed: Option<String>,
 }
@@ -161,6 +162,7 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
         no_stat: false,
         gitignore: false,
         follow: false,
+        fit: false,
         preview: None,
         git_changed: None,
     };
@@ -181,6 +183,7 @@ fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
             "--gitignore" | "-g" => ga.gitignore = true,
             "--hidden" | "-a" => ga.hidden = true,
             "--follow" | "-L" => ga.follow = true,
+            "--fit" => ga.fit = true,
             "--dirs" | "-d" => ga.only_dirs = true,
             "--preview" | "-P" => {
                 let val = args.value(&flag, "a spec (N, N-M, or code:N)")?;
@@ -423,13 +426,28 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
         no_stat: ga.no_stat,
         gitignore: ga.gitignore,
         follow_symlinks: ga.follow,
+        budget_mode: if ga.fit { BudgetMode::Fit } else { BudgetMode::Stop },
         exclude,
         filter,
         ..WalkOptions::default()
     };
 
     let results = globber::walk_many(&patterns, opts).map_err(|e| e.to_string())?;
-    let entries: Vec<Entry> = results.into_iter().filter_map(|r| r.ok()).collect();
+    let mut entries: Vec<Entry> = Vec::with_capacity(results.len());
+    let mut errors = Vec::new();
+    for r in results {
+        match r {
+            Ok(e) => entries.push(e),
+            Err(e) => errors.push(e),
+        }
+    }
+    if let Some(first) = errors.first() {
+        let more = match errors.len() {
+            1 => String::new(),
+            n => format!(" (and {} more)", n - 1),
+        };
+        eprintln!("warning: skipped unreadable directory: {}{}", first, more);
+    }
 
     let output = match ga.format {
         OutputFormat::Paths => to_paths(&entries),
@@ -438,7 +456,7 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
                 token_budget: ga.token_budget,
                 byte_budget: ga.byte_budget,
                 wall_time_ms: t0.elapsed().as_millis() as u64,
-                ..BudgetInfo::default()
+                unreadable_dirs: errors.len(),
             });
             let mut out = to_sif_with(&entries, &SifOptions { no_stat: ga.no_stat, summary });
             if let Some(ref mode) = ga.preview {
@@ -590,7 +608,7 @@ OPTIONS
   -S, --summary
       Append a §summary section: total files, dirs, bytes, estimated
       tokens, kind breakdown, wall time, and budget remaining (if a
-      budget was set). SIF output only.
+      budget was set), and unreadable directories. SIF output only.
 
   -P, --preview <SPEC>
       Append a §preview section with an excerpt of each matched text file.
@@ -659,6 +677,11 @@ OPTIONS
   --byte-budget <N | unlimited>
       Like --token-budget, for total file bytes.
 
+  --fit
+      With a budget: instead of stopping at the first result that doesn't
+      fit, skip it and keep going, packing as many results as fit (in
+      sorted order). Walks the whole tree.
+
   -k, --kind <KIND,...>
       Only yield files of the given kind(s). Comma-separated: source, test,
       config, build, doc, data, generated, binary, unknown.
@@ -692,6 +715,7 @@ EXAMPLES
 
   AI context packing:
     globber '**/*.rs' -g -t 80K -S              Budget-aware: stop at 80K tokens
+    globber '**/*.rs' -g -t 80K --fit           Pack as many files as fit in 80K
     globber '**/*.rs' -g -k source -P code:15   Scope a project in one shot
     globber '**' -g -k source,config -S         Source + config files with summary
 

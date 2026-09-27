@@ -23,6 +23,8 @@ pub enum PatternErrorKind {
     /// Brace expansion would produce more than
     /// [`MAX_BRACE_EXPANSIONS`](crate::pattern::MAX_BRACE_EXPANSIONS) patterns.
     TooManyExpansions,
+    /// Unknown POSIX class name in a bracket expression (e.g. `[[:foo:]]`).
+    UnknownCharClass,
 }
 
 impl fmt::Display for PatternError {
@@ -35,6 +37,7 @@ impl fmt::Display for PatternError {
             PatternErrorKind::UnclosedBracket => "unclosed `[` bracket expression",
             PatternErrorKind::EmptyBracket => "empty bracket expression",
             PatternErrorKind::TooManyExpansions => "brace expansion produces too many patterns",
+            PatternErrorKind::UnknownCharClass => "unknown character class (try [:alpha:], [:digit:], ...)",
         };
         write!(f, "pattern error at byte {}: {}", self.pos, msg)
     }

@@ -37,6 +37,62 @@ pub enum Token {
 pub enum CharSpec {
     Single(char),
     Range(char, char),
+    /// POSIX character class, e.g. `[:alpha:]`.
+    Class(CharClass),
+}
+
+/// POSIX character classes usable inside bracket expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharClass {
+    Alpha,
+    Digit,
+    Alnum,
+    Upper,
+    Lower,
+    Space,
+    Blank,
+    Punct,
+    Xdigit,
+    Cntrl,
+    Graph,
+    Print,
+}
+
+impl CharClass {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "alpha" => CharClass::Alpha,
+            "digit" => CharClass::Digit,
+            "alnum" => CharClass::Alnum,
+            "upper" => CharClass::Upper,
+            "lower" => CharClass::Lower,
+            "space" => CharClass::Space,
+            "blank" => CharClass::Blank,
+            "punct" => CharClass::Punct,
+            "xdigit" => CharClass::Xdigit,
+            "cntrl" => CharClass::Cntrl,
+            "graph" => CharClass::Graph,
+            "print" => CharClass::Print,
+            _ => return None,
+        })
+    }
+
+    fn matches(self, c: char, case_sensitive: bool) -> bool {
+        match self {
+            CharClass::Alpha => c.is_alphabetic(),
+            CharClass::Digit => c.is_ascii_digit(),
+            CharClass::Alnum => c.is_alphanumeric(),
+            CharClass::Upper => c.is_uppercase() || (!case_sensitive && c.is_lowercase()),
+            CharClass::Lower => c.is_lowercase() || (!case_sensitive && c.is_uppercase()),
+            CharClass::Space => c.is_whitespace(),
+            CharClass::Blank => c == ' ' || c == '\t',
+            CharClass::Punct => c.is_ascii_punctuation(),
+            CharClass::Xdigit => c.is_ascii_hexdigit(),
+            CharClass::Cntrl => c.is_control(),
+            CharClass::Graph => !c.is_control() && !c.is_whitespace(),
+            CharClass::Print => !c.is_control(),
+        }
+    }
 }
 
 impl CharSpec {
@@ -53,6 +109,7 @@ impl CharSpec {
                     c >= lo && c <= hi
                 }
             }
+            CharSpec::Class(class) => class.matches(c, case_sensitive),
         }
     }
 }
@@ -138,41 +195,9 @@ impl Pattern {
                 }
                 b'[' => {
                     has_meta = true;
-                    let start = i;
-                    i += 1;
-                    let negated = i < bytes.len() && bytes[i] == b'!';
-                    if negated {
-                        i += 1;
-                    }
-                    // First char after `[` or `[!` can be `]` and is literal.
-                    let bracket_start = i;
-                    if i < bytes.len() && bytes[i] == b']' {
-                        i += 1;
-                    }
-                    // Find closing `]`.
-                    while i < bytes.len() && bytes[i] != b']' {
-                        i += 1;
-                    }
-                    if i >= bytes.len() {
-                        return Err(PatternError {
-                            pos: start,
-                            kind: PatternErrorKind::UnclosedBracket,
-                        });
-                    }
-                    let inner = &pattern[bracket_start..i];
-                    i += 1; // skip `]`
-                    if inner.is_empty() {
-                        return Err(PatternError {
-                            pos: start,
-                            kind: PatternErrorKind::EmptyBracket,
-                        });
-                    }
-                    let specs = parse_char_specs(inner);
-                    if negated {
-                        tokens.push(Token::AnyExcept(specs));
-                    } else {
-                        tokens.push(Token::AnyWithin(specs));
-                    }
+                    let (token, next) = parse_bracket(pattern, i)?;
+                    tokens.push(token);
+                    i = next;
                 }
                 b'\\' => {
                     // Backslash escape: next char is literal.
@@ -263,20 +288,78 @@ pub(crate) fn chars_eq(a: char, b: char, case_sensitive: bool) -> bool {
     }
 }
 
-fn parse_char_specs(s: &str) -> Vec<CharSpec> {
-    let chars: Vec<char> = s.chars().collect();
+/// Parse a bracket expression starting at the `[` at byte `start`.
+/// Returns the token and the byte offset just past the closing `]`.
+///
+/// Supports `[!...]` and `[^...]` negation, a literal `]` first, ranges,
+/// `\x` escapes, and POSIX classes like `[:alpha:]`.
+fn parse_bracket(pattern: &str, start: usize) -> Result<(Token, usize), PatternError> {
+    let err = |kind| PatternError { pos: start, kind };
+    let body = &pattern[start + 1..];
+    let mut chars = body.char_indices().peekable();
+
+    let negated = matches!(chars.peek(), Some((_, '!' | '^')));
+    if negated {
+        chars.next();
+    }
+
     let mut specs = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if i + 2 < chars.len() && chars[i + 1] == '-' {
-            specs.push(CharSpec::Range(chars[i], chars[i + 2]));
-            i += 3;
+    let mut first = true;
+    // Read one (possibly escaped) character of the set.
+    let read_char = |c: char, chars: &mut std::iter::Peekable<std::str::CharIndices>| {
+        if c == '\\' { chars.next().map(|(_, e)| e) } else { Some(c) }
+    };
+
+    loop {
+        let Some((off, c)) = chars.next() else {
+            return Err(err(PatternErrorKind::UnclosedBracket));
+        };
+        if c == ']' && !first {
+            if specs.is_empty() {
+                return Err(err(PatternErrorKind::EmptyBracket));
+            }
+            let token = if negated { Token::AnyExcept(specs) } else { Token::AnyWithin(specs) };
+            return Ok((token, start + 1 + off + 1));
+        }
+        first = false;
+
+        // POSIX character class: [:name:]
+        if c == '[' && body[off + 1..].starts_with(':') {
+            let rest = &body[off + 2..];
+            let Some(end) = rest.find(":]") else {
+                return Err(err(PatternErrorKind::UnclosedBracket));
+            };
+            let class = CharClass::from_name(&rest[..end])
+                .ok_or_else(|| err(PatternErrorKind::UnknownCharClass))?;
+            specs.push(CharSpec::Class(class));
+            // Skip `:name:]`.
+            let skip_to = off + 2 + end + 2;
+            while chars.peek().is_some_and(|&(o, _)| o < skip_to) {
+                chars.next();
+            }
+            continue;
+        }
+
+        let Some(lo) = read_char(c, &mut chars) else {
+            return Err(err(PatternErrorKind::UnclosedBracket));
+        };
+        // A range needs a `-` followed by something other than the closing `]`.
+        let is_range = chars.peek().is_some_and(|&(_, d)| d == '-')
+            && body[chars.peek().unwrap().0 + 1..]
+                .chars()
+                .next()
+                .is_some_and(|d| d != ']');
+        if is_range {
+            chars.next(); // `-`
+            let (_, h) = chars.next().unwrap();
+            let Some(hi) = read_char(h, &mut chars) else {
+                return Err(err(PatternErrorKind::UnclosedBracket));
+            };
+            specs.push(CharSpec::Range(lo, hi));
         } else {
-            specs.push(CharSpec::Single(chars[i]));
-            i += 1;
+            specs.push(CharSpec::Single(lo));
         }
     }
-    specs
 }
 
 // ── Brace expansion ─────────────────────────────────────────────────

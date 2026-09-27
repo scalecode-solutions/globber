@@ -526,3 +526,68 @@ fn star_matches_spaces() {
     assert!(pat.matches("hello world.txt"));
     assert!(pat.matches("  .txt"));
 }
+
+// ── Bracket extensions ──────────────────────────────────────────────
+
+#[test]
+fn bracket_caret_negation() {
+    let pat = Pattern::new("[^abc]").unwrap();
+    assert!(!pat.matches("a"));
+    assert!(pat.matches("d"));
+}
+
+#[test]
+fn bracket_posix_classes() {
+    let alpha = Pattern::new("[[:alpha:]]*").unwrap();
+    assert!(alpha.matches("abc"));
+    assert!(alpha.matches("Émile"));
+    assert!(!alpha.matches("1abc"));
+    let mixed = Pattern::new("v[[:digit:].]*").unwrap();
+    assert!(mixed.matches("v1.2.3"));
+    assert!(!mixed.matches("vx"));
+    let neg = Pattern::new("[![:space:]]").unwrap();
+    assert!(neg.matches("x"));
+    assert!(!neg.matches(" "));
+    assert!(Pattern::new("[[:xdigit:]]").unwrap().matches("F"));
+    assert!(Pattern::new("[[:upper:]]").unwrap().matches("Q"));
+    assert!(!Pattern::new("[[:upper:]]").unwrap().matches("q"));
+}
+
+#[test]
+fn bracket_unknown_class_is_error() {
+    let err = Pattern::new("[[:nope:]]").unwrap_err();
+    assert_eq!(err.kind, globber::PatternErrorKind::UnknownCharClass);
+}
+
+#[test]
+fn bracket_escapes_inside() {
+    let pat = Pattern::new("[\\]a]").unwrap();
+    assert!(pat.matches("]"));
+    assert!(pat.matches("a"));
+    assert!(!pat.matches("\\"));
+    let pat = Pattern::new("[a\\-z]").unwrap();
+    assert!(pat.matches("-"));
+    assert!(!pat.matches("m"));
+}
+
+#[test]
+fn bracket_open_bracket_literal() {
+    // `[` inside a set that isn't `[:` is literal.
+    let pat = Pattern::new("[[a]").unwrap();
+    assert!(pat.matches("["));
+    assert!(pat.matches("a"));
+}
+
+#[test]
+fn bracket_adversarial_unclosed() {
+    for p in ["[", "[!", "[^", "[]", "[!]", "[a", "[[:alpha:]", "[[:alpha", "[a-", "[\\"] {
+        assert!(Pattern::new(p).is_err(), "{:?} should fail", p);
+    }
+}
+
+#[test]
+fn bracket_unicode_range() {
+    let pat = Pattern::new("[α-ω]").unwrap();
+    assert!(pat.matches("λ"));
+    assert!(!pat.matches("a"));
+}
