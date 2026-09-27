@@ -25,6 +25,9 @@ pub enum PatternErrorKind {
     TooManyExpansions,
     /// Unknown POSIX class name in a bracket expression (e.g. `[[:foo:]]`).
     UnknownCharClass,
+    /// A bracket expression contains `/`, which wildcards never match
+    /// when walking the filesystem (e.g. `src/[a/b].rs`).
+    SlashInBracket,
 }
 
 impl fmt::Display for PatternError {
@@ -37,6 +40,9 @@ impl fmt::Display for PatternError {
             PatternErrorKind::UnclosedBracket => "unclosed `[` bracket expression",
             PatternErrorKind::EmptyBracket => "empty bracket expression",
             PatternErrorKind::TooManyExpansions => "brace expansion produces too many patterns",
+            PatternErrorKind::SlashInBracket => {
+                "bracket expressions can't contain `/` (path components are matched one at a time)"
+            }
             PatternErrorKind::UnknownCharClass => "unknown character class (try [:alpha:], [:digit:], ...)",
         };
         write!(f, "pattern error at byte {}: {}", self.pos, msg)

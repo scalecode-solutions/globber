@@ -18,7 +18,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::entry::Entry;
-use crate::error::GlobError;
+use crate::error::{GlobError, PatternError, PatternErrorKind};
 use crate::ignore::IgnoreStack;
 use crate::matcher::MatchOptions;
 use crate::pattern::{try_expand_braces, Pattern};
@@ -243,13 +243,26 @@ fn compile(pattern: &str) -> Result<(PathBuf, Compiled), GlobError> {
         }
     }
 
-    let rest = &pattern[rest_start.min(pattern.len())..];
+    let rest_start = rest_start.min(pattern.len());
+    let rest = &pattern[rest_start..];
     let mut comps: Vec<Pattern> = Vec::new();
+    let mut offset = rest_start;
     for s in rest.split(|c: char| c == '/' || (cfg!(windows) && c == '\\')) {
+        let comp_start = offset;
+        offset += s.len() + 1;
         if s.is_empty() || s == "." {
             continue;
         }
-        let comp = Pattern::new(s)?;
+        // The whole pattern parsed, so a component that doesn't must hold
+        // part of a bracket expression spanning a `/`. Wildcards never
+        // match `/` in a walk, so such a bracket could never match.
+        let comp = Pattern::new(s).map_err(|e| match e.kind {
+            PatternErrorKind::UnclosedBracket | PatternErrorKind::EmptyBracket => PatternError {
+                pos: comp_start + e.pos,
+                kind: PatternErrorKind::SlashInBracket,
+            },
+            _ => e,
+        })?;
         if comp.is_recursive && comps.last().is_some_and(|c| c.is_recursive) {
             continue;
         }
@@ -773,6 +786,19 @@ mod tests {
     fn split_collapses_recursive() {
         let (_, c) = compile("a/**/**/b").unwrap();
         assert_eq!(comps(&c), vec!["a", "**", "b"]);
+    }
+
+    #[test]
+    fn slash_in_bracket_is_a_clear_error() {
+        for p in ["src/[a/b].rs", "[/]x", "a/[!/]"] {
+            match compile(p) {
+                Err(GlobError::Pattern(e)) => {
+                    assert_eq!(e.kind, PatternErrorKind::SlashInBracket, "{}", p);
+                    assert_eq!(&p[e.pos..e.pos + 1], "[", "{} pos {}", p, e.pos);
+                }
+                _ => panic!("{} should fail", p),
+            }
+        }
     }
 
     #[test]

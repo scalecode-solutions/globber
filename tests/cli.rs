@@ -305,7 +305,7 @@ fn bad_values_are_usage_errors() {
 #[test]
 fn bad_patterns_are_errors_not_panics() {
     let dir = project();
-    for p in ["a**b", "[unclosed", "***", "[[:nope:]]", &"{a,b}".repeat(20)] {
+    for p in ["a**b", "[unclosed", "***", "[[:nope:]]", "src/[a/b].rs", &"{a,b}".repeat(20)] {
         let out = globber(dir.path(), &[p]);
         assert_eq!(out.status.code(), Some(1), "pattern {:?}", p);
         assert!(stderr(&out).starts_with("error:"), "{:?}: {}", p, stderr(&out));
