@@ -9,24 +9,27 @@ use std::env;
 use std::process;
 
 use globber::{
-    expand_braces, to_paths, to_sif, Entry, EntryFilter, FileKind, MatchOptions,
-    WalkOptions,
+    to_paths, to_sif_with, BudgetInfo, Entry, EntryFilter, FileKind, MatchOptions, PreviewMode,
+    SifOptions, WalkOptions,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── Argument parsing ─────────────────────────────────────────────────
 
-struct Args {
-    command: Command,
-}
-
 enum Command {
     Glob(GlobArgs),
     Match(MatchArgs),
     Expand(String),
-    Help,
+    Help(HelpTopic),
     Version,
+}
+
+#[derive(Clone, Copy)]
+enum HelpTopic {
+    Main,
+    Match,
+    Expand,
 }
 
 struct GlobArgs {
@@ -46,7 +49,7 @@ struct GlobArgs {
     no_stat: bool,
     gitignore: bool,
     follow: bool,
-    preview: Option<globber::PreviewMode>,
+    preview: Option<PreviewMode>,
     git_changed: Option<String>,
 }
 
@@ -54,6 +57,7 @@ struct MatchArgs {
     pattern: String,
     inputs: Vec<String>,
     case_insensitive: bool,
+    pathname: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -62,37 +66,84 @@ enum OutputFormat {
     Paths,
 }
 
-fn parse_args() -> Result<Args, String> {
-    let mut args = env::args().skip(1).peekable();
+/// Command-line arguments, with `--flag=value` split into flag and value.
+struct ArgStream {
+    args: std::iter::Peekable<std::vec::IntoIter<String>>,
+    /// Value attached with `=` to the flag being processed.
+    inline: Option<String>,
+}
 
-    // No arguments → help.
-    if args.peek().is_none() {
-        return Ok(Args { command: Command::Help });
+impl ArgStream {
+    fn new(args: Vec<String>) -> Self {
+        ArgStream { args: args.into_iter().peekable(), inline: None }
     }
 
-    let first = args.peek().unwrap().clone();
+    /// The next raw argument, splitting `--flag=value`.
+    fn next_flag(&mut self) -> Option<String> {
+        let arg = self.args.next()?;
+        if arg.starts_with("--") {
+            if let Some((flag, value)) = arg.split_once('=') {
+                self.inline = Some(value.to_string());
+                return Some(flag.to_string());
+            }
+        }
+        Some(arg)
+    }
+
+    /// The value for `flag`: inline (`--flag=v`) or the next argument.
+    fn value(&mut self, flag: &str, what: &str) -> Result<String, String> {
+        self.inline
+            .take()
+            .or_else(|| self.args.next())
+            .ok_or_else(|| format!("{} requires {}", flag, what))
+    }
+
+    /// Fail if a flag that takes no value was given one with `=`.
+    fn no_value(&mut self, flag: &str) -> Result<(), String> {
+        match self.inline.take() {
+            Some(v) => Err(format!("{} does not take a value (got {:?})", flag, v)),
+            None => Ok(()),
+        }
+    }
+}
+
+fn parse_args(raw: Vec<String>) -> Result<Command, String> {
+    let mut args = ArgStream::new(raw);
+
+    let Some(first) = args.args.peek().cloned() else {
+        return Ok(Command::Help(HelpTopic::Main));
+    };
     match first.as_str() {
-        "--help" | "-h" | "help" => return Ok(Args { command: Command::Help }),
-        "--version" | "-V" => return Ok(Args { command: Command::Version }),
+        "--help" | "-h" => return Ok(Command::Help(HelpTopic::Main)),
+        "--version" | "-V" => return Ok(Command::Version),
+        "help" => {
+            args.args.next();
+            let topic = match args.args.next().as_deref() {
+                Some("match") => HelpTopic::Match,
+                Some("expand") => HelpTopic::Expand,
+                _ => HelpTopic::Main,
+            };
+            return Ok(Command::Help(topic));
+        }
         "match" => {
-            args.next();
+            args.args.next();
             return parse_match_args(args);
         }
         "expand" => {
-            args.next();
-            let pattern = args.next().ok_or("expand requires a pattern")?;
-            return Ok(Args { command: Command::Expand(pattern) });
+            args.args.next();
+            return match args.args.next() {
+                Some(h) if h == "--help" || h == "-h" => Ok(Command::Help(HelpTopic::Expand)),
+                Some(pattern) => Ok(Command::Expand(pattern)),
+                None => Err("expand requires a pattern".to_string()),
+            };
         }
         _ => {}
     }
 
-    // Default command: glob
     parse_glob_args(args)
 }
 
-fn parse_glob_args(
-    mut args: std::iter::Peekable<std::iter::Skip<env::Args>>,
-) -> Result<Args, String> {
+fn parse_glob_args(mut args: ArgStream) -> Result<Command, String> {
     let mut ga = GlobArgs {
         patterns: Vec::new(),
         excludes: Vec::new(),
@@ -114,10 +165,14 @@ fn parse_glob_args(
         git_changed: None,
     };
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--help" | "-h" => return Ok(Args { command: Command::Help }),
-            "--version" | "-V" => return Ok(Args { command: Command::Version }),
+    while let Some(flag) = args.next_flag() {
+        match flag.as_str() {
+            "--" => {
+                ga.patterns.extend(args.args.by_ref());
+                break;
+            }
+            "--help" | "-h" => return Ok(Command::Help(HelpTopic::Main)),
+            "--version" | "-V" => return Ok(Command::Version),
             "--paths" | "-p" => ga.format = OutputFormat::Paths,
             "--sif" | "-s" => ga.format = OutputFormat::Sif,
             "--summary" | "-S" => ga.summary = true,
@@ -128,106 +183,148 @@ fn parse_glob_args(
             "--follow" | "-L" => ga.follow = true,
             "--dirs" | "-d" => ga.only_dirs = true,
             "--preview" | "-P" => {
-                let val = args.next().ok_or("--preview requires a spec (N, N-M, or code:N)")?;
-                ga.preview = Some(globber::PreviewMode::parse(&val)?);
+                let val = args.value(&flag, "a spec (N, N-M, or code:N)")?;
+                ga.preview = Some(PreviewMode::parse(&val)?);
             }
             "--git-changed" | "-G" => {
-                // Optional ref argument; defaults to HEAD if next arg looks like a flag or is absent.
-                let ref_name = match args.peek() {
-                    Some(next) if !next.starts_with('-') => args.next().unwrap(),
-                    _ => "HEAD".to_string(),
+                // The ref is optional. The next argument is taken as the ref
+                // unless it is a flag or looks like a glob (refs cannot
+                // contain `*`, `?` or `[`); use --git-changed=REF to be explicit.
+                let ref_name = match args.inline.take() {
+                    Some(r) => r,
+                    None => match args.args.peek() {
+                        Some(next) if !next.starts_with('-') && !next.contains(['*', '?', '[']) => {
+                            args.args.next().unwrap()
+                        }
+                        _ => "HEAD".to_string(),
+                    },
                 };
                 ga.git_changed = Some(ref_name);
             }
-            "--root" | "-r" => {
-                let val = args.next().ok_or("--root requires a path")?;
-                ga.root = Some(val);
-            }
-            "--depth" => {
-                let val = args.next().ok_or("--depth requires a number")?;
-                ga.max_depth = Some(val.parse().map_err(|_| "--depth must be a number")?).filter(|&d| d > 0);
-            }
-            "--exclude" | "-e" => {
-                let val = args.next().ok_or("--exclude requires a pattern")?;
-                ga.excludes.push(val);
-            }
-            "--limit" | "-n" => {
-                let val = args.next().ok_or("--limit requires a number")?;
-                ga.limit = Some(val.parse().map_err(|_| "--limit must be a number")?).filter(|&n| n > 0);
-            }
+            "--root" | "-r" => ga.root = Some(args.value(&flag, "a path")?),
+            "--depth" => ga.max_depth = parse_count(&flag, &args.value(&flag, "a number")?)?,
+            "--exclude" | "-e" => ga.excludes.push(args.value(&flag, "a pattern")?),
+            "--limit" | "-n" => ga.limit = parse_count(&flag, &args.value(&flag, "a number")?)?,
             "--byte-budget" => {
-                let val = args.next().ok_or("--byte-budget requires a number")?;
-                ga.byte_budget = Some(parse_size(&val)?).filter(|&n| n > 0);
+                ga.byte_budget = parse_budget(&flag, &args.value(&flag, "a size")?)?;
             }
             "--token-budget" | "-t" => {
-                let val = args.next().ok_or("--token-budget requires a number")?;
-                ga.token_budget = Some(parse_size(&val)?).filter(|&n| n > 0);
+                ga.token_budget = parse_budget(&flag, &args.value(&flag, "a size")?)?;
             }
             "--kind" | "-k" => {
-                let val = args.next().ok_or("--kind requires a value")?;
+                let val = args.value(&flag, "a kind list")?;
                 for k in val.split(',') {
                     ga.kind_filter.push(parse_kind(k.trim())?);
                 }
             }
-            s if s.starts_with('-') => {
+            s if s.starts_with('-') && s.len() > 1 => {
                 return Err(format!("unknown option: {}", s));
             }
-            _ => {
-                ga.patterns.push(arg);
-            }
+            _ => ga.patterns.push(flag.clone()),
         }
+        args.no_value(&flag)?;
     }
 
     if ga.patterns.is_empty() {
         return Err("no patterns given".to_string());
     }
-
-    Ok(Args { command: Command::Glob(ga) })
+    Ok(Command::Glob(ga))
 }
 
-fn parse_match_args(
-    mut args: std::iter::Peekable<std::iter::Skip<env::Args>>,
-) -> Result<Args, String> {
+fn parse_match_args(mut args: ArgStream) -> Result<Command, String> {
     let mut ma = MatchArgs {
         pattern: String::new(),
         inputs: Vec::new(),
         case_insensitive: false,
+        pathname: false,
     };
+    let mut have_pattern = false;
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
+    while let Some(flag) = args.next_flag() {
+        match flag.as_str() {
+            "--help" | "-h" => return Ok(Command::Help(HelpTopic::Match)),
             "-i" | "--ignore-case" => ma.case_insensitive = true,
-            s if s.starts_with('-') => return Err(format!("unknown option: {}", s)),
-            _ => {
-                if ma.pattern.is_empty() {
-                    ma.pattern = arg;
-                } else {
-                    ma.inputs.push(arg);
+            "--pathname" => ma.pathname = true,
+            "--" => {
+                for a in args.args.by_ref() {
+                    if have_pattern {
+                        ma.inputs.push(a);
+                    } else {
+                        ma.pattern = a;
+                        have_pattern = true;
+                    }
                 }
+                break;
             }
+            s if s.starts_with('-') && s.len() > 1 => {
+                return Err(format!("unknown option: {}", s));
+            }
+            _ if !have_pattern => {
+                ma.pattern = flag.clone();
+                have_pattern = true;
+            }
+            _ => ma.inputs.push(flag.clone()),
         }
+        args.no_value(&flag)?;
     }
 
-    if ma.pattern.is_empty() {
+    if !have_pattern {
         return Err("match requires a pattern".to_string());
     }
-
-    Ok(Args { command: Command::Match(ma) })
+    Ok(Command::Match(ma))
 }
 
+/// Parse a count flag: a positive integer, or `unlimited`.
+fn parse_count(flag: &str, val: &str) -> Result<Option<usize>, String> {
+    if val == "unlimited" {
+        return Ok(None);
+    }
+    match val.parse::<usize>() {
+        Ok(0) => Err(format!(
+            "{} must be at least 1 (use `{} unlimited` for no limit)",
+            flag, flag
+        )),
+        Ok(n) => Ok(Some(n)),
+        Err(_) => Err(format!(
+            "{} expects a positive number or `unlimited`, got {:?}",
+            flag, val
+        )),
+    }
+}
+
+/// Parse a budget flag: a positive size (see [`parse_size`]), or `unlimited`.
+fn parse_budget(flag: &str, val: &str) -> Result<Option<u64>, String> {
+    if val == "unlimited" {
+        return Ok(None);
+    }
+    match parse_size(val)? {
+        0 => Err(format!(
+            "{} must be greater than 0 (use `{} unlimited` for no budget)",
+            flag, flag
+        )),
+        n => Ok(Some(n)),
+    }
+}
+
+/// Parse a size with an optional decimal suffix: `500`, `80K`, `1.5M`, `2G`.
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
-    let (num, mult) = if s.ends_with('K') || s.ends_with('k') {
-        (&s[..s.len() - 1], 1_000u64)
-    } else if s.ends_with('M') || s.ends_with('m') {
-        (&s[..s.len() - 1], 1_000_000)
-    } else if s.ends_with('G') || s.ends_with('g') {
-        (&s[..s.len() - 1], 1_000_000_000)
-    } else {
-        (s, 1)
+    let invalid = || format!("invalid size: {:?} (examples: 500, 80K, 1.5M, 2G)", s);
+    let (num, mult) = match s.char_indices().last() {
+        Some((i, 'K' | 'k')) => (&s[..i], 1_000u64),
+        Some((i, 'M' | 'm')) => (&s[..i], 1_000_000),
+        Some((i, 'G' | 'g')) => (&s[..i], 1_000_000_000),
+        _ => (s, 1),
     };
-    let n: u64 = num.parse().map_err(|_| format!("invalid number: {}", s))?;
-    Ok(n * mult)
+    if let Ok(n) = num.parse::<u64>() {
+        return n.checked_mul(mult).ok_or_else(invalid);
+    }
+    let f: f64 = num.parse().map_err(|_| invalid())?;
+    let v = f * mult as f64;
+    if !v.is_finite() || v < 0.0 || v >= u64::MAX as f64 {
+        return Err(invalid());
+    }
+    Ok(v.round() as u64)
 }
 
 fn parse_kind(s: &str) -> Result<FileKind, String> {
@@ -242,7 +339,7 @@ fn parse_kind(s: &str) -> Result<FileKind, String> {
         "binary" => Ok(FileKind::Binary),
         "unknown" => Ok(FileKind::Unknown),
         _ => Err(format!(
-            "unknown kind: {:?} (try: source, test, config, build, doc, data, generated, binary)",
+            "unknown kind: {:?} (try: source, test, config, build, doc, data, generated, binary, unknown)",
             s
         )),
     }
@@ -252,6 +349,15 @@ fn parse_kind(s: &str) -> Result<FileKind, String> {
 
 fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
     let t0 = std::time::Instant::now();
+
+    if ga.format == OutputFormat::Paths {
+        if ga.summary {
+            eprintln!("warning: --summary has no effect with --paths");
+        }
+        if ga.preview.is_some() {
+            eprintln!("warning: --preview has no effect with --paths");
+        }
+    }
 
     // Normalize --root: "." and "./" mean the current directory.
     let root = ga
@@ -323,34 +429,24 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
     };
 
     let results = globber::walk_many(&patterns, opts).map_err(|e| e.to_string())?;
-    let owned: Vec<Entry> = results.into_iter().filter_map(|r| r.ok()).collect();
+    let entries: Vec<Entry> = results.into_iter().filter_map(|r| r.ok()).collect();
 
-    let elapsed = t0.elapsed();
-    let budget = globber::BudgetInfo {
-        token_budget: ga.token_budget.unwrap_or(0),
-        byte_budget: ga.byte_budget.unwrap_or(0),
-        wall_time_ms: elapsed.as_millis() as u64,
-    };
-
-    // Build the SIF output string so we can append preview.
-    let mut output = match ga.format {
+    let output = match ga.format {
+        OutputFormat::Paths => to_paths(&entries),
         OutputFormat::Sif => {
-            if ga.summary {
-                globber::to_sif_with_summary_and_budget(&owned, &budget)
-            } else {
-                to_sif(&owned)
+            let summary = ga.summary.then(|| BudgetInfo {
+                token_budget: ga.token_budget,
+                byte_budget: ga.byte_budget,
+                wall_time_ms: t0.elapsed().as_millis() as u64,
+                ..BudgetInfo::default()
+            });
+            let mut out = to_sif_with(&entries, &SifOptions { no_stat: ga.no_stat, summary });
+            if let Some(ref mode) = ga.preview {
+                globber::write_preview(&entries, mode, &mut out).map_err(|e| e.to_string())?;
             }
+            out
         }
-        OutputFormat::Paths => to_paths(&owned),
     };
-
-    // Append preview section.
-    if let Some(ref mode) = ga.preview {
-        if ga.format == OutputFormat::Sif {
-            globber::write_preview(&owned, mode, &mut output)
-                .map_err(|e| e.to_string())?;
-        }
-    }
 
     print!("{}", output);
     Ok(())
@@ -360,6 +456,7 @@ fn cmd_match(ma: MatchArgs) -> Result<(), String> {
     let pattern = globber::Pattern::new(&ma.pattern).map_err(|e| e.to_string())?;
     let opts = MatchOptions {
         case_sensitive: !ma.case_insensitive,
+        require_literal_separator: ma.pathname,
         ..MatchOptions::new()
     };
 
@@ -369,7 +466,7 @@ fn cmd_match(ma: MatchArgs) -> Result<(), String> {
         std::io::stdin()
             .lock()
             .lines()
-            .filter_map(|l| l.ok())
+            .map_while(Result::ok)
             .collect()
     } else {
         ma.inputs
@@ -389,16 +486,56 @@ fn cmd_match(ma: MatchArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_expand(pattern: &str) {
-    for p in expand_braces(pattern) {
+fn cmd_expand(pattern: &str) -> Result<(), String> {
+    for p in globber::try_expand_braces(pattern).map_err(|e| e.to_string())? {
         println!("{}", p);
     }
+    Ok(())
 }
 
 // ── Help ─────────────────────────────────────────────────────────────
 
-fn print_help() {
-    eprint!("\
+fn print_help(topic: HelpTopic) {
+    match topic {
+        HelpTopic::Main => print!("{}", HELP_MAIN.replace("{VERSION}", VERSION)),
+        HelpTopic::Match => print!("{}", HELP_MATCH),
+        HelpTopic::Expand => print!("{}", HELP_EXPAND),
+    }
+}
+
+const HELP_MATCH: &str = "\
+globber match [OPTIONS] <PATTERN> [INPUT]...
+
+  Pure string pattern matching (no filesystem). Tests each INPUT against
+  PATTERN and prints the ones that match. Reads inputs from stdin (one per
+  line) if none are given. Exits 1 if nothing matched.
+
+  By default `*` and `?` also match `/`, so '*.rs' matches src/main.rs.
+  Use --pathname for filesystem-walk semantics, where they stop at `/`.
+
+OPTIONS
+  -i, --ignore-case   Case-insensitive matching (ASCII only).
+      --pathname      `*` and `?` do not match `/` (POSIX FNM_PATHNAME).
+  --                  Treat all following arguments as pattern/inputs.
+
+EXAMPLES
+  globber match '*.rs' main.rs lib.py          prints main.rs
+  globber match --pathname '*.rs' src/main.rs  no match (exit 1)
+  printf 'a.rs\\nb.py\\n' | globber match '*.rs'
+";
+
+const HELP_EXPAND: &str = "\
+globber expand <PATTERN>
+
+  Expand brace expressions and print each resulting pattern, one per line,
+  in order. Braces nest; `\\{`, `\\}` and `\\,` are literal; an unmatched `{`
+  is left as-is. Expansions are capped at 10,000 patterns.
+
+EXAMPLE
+  globber expand 'src/{lib,main,util/{a,b}}.rs'
+";
+
+const HELP_MAIN: &str = "\
 globber {VERSION} — AI-native glob for the SIF ecosystem
 
   A ground-up Rust rewrite of Unix glob, rooted in the POSIX glob(3) and
@@ -406,19 +543,17 @@ globber {VERSION} — AI-native glob for the SIF ecosystem
   pattern matching, parallel directory walking, token-budget-aware traversal,
   file classification, and native SIF v1 output.
 
-  Part of the SIF ecosystem: sif-parser, sif-scratch, STP, SWT, SIL.
-
 USAGE
 
   globber [OPTIONS] <PATTERN>...
-      Walk the filesystem, match files against one or more glob patterns,
-      and emit results as a SIF v1 document (or plain paths with --paths).
+      Walk the filesystem once, matching files against every PATTERN, and
+      emit the results (each path at most once, sorted) as a SIF v1
+      document, or plain paths with --paths.
 
-  globber match [OPTIONS] <PATTERN> [INPUT]...
-      Pure string pattern matching (no filesystem). Tests each INPUT against
-      PATTERN and prints matches. Reads from stdin if no INPUTs given.
+  globber match [OPTIONS] <PATTERN> [INPUT]...     (see: globber help match)
+      Pure string pattern matching (no filesystem).
 
-  globber expand <PATTERN>
+  globber expand <PATTERN>                         (see: globber help expand)
       Expand brace expressions and print each resulting pattern.
 
 PATTERNS
@@ -427,111 +562,132 @@ PATTERNS
   *              Match any sequence of characters within one path component.
   **             Match zero or more path components (recursive descent).
   [abc]          Match one character in the set.
-  [!abc]         Match one character NOT in the set.
+  [!abc] [^abc]  Match one character NOT in the set.
   [a-z]          Match a character range.
-  {{a,b,c}}        Brace expansion — generates one pattern per alternative.
+  [[:alpha:]]    POSIX character class (alpha digit alnum upper lower space
+                 punct xdigit blank cntrl graph print).
+  {a,b,c}        Brace expansion. All alternatives share a single walk.
   \\x             Literal escape — match the next character verbatim.
+  dir/           A trailing slash matches directories only.
 
   Patterns follow POSIX fnmatch(3) semantics. ** must be a standalone path
-  component (a/**/b is valid, a**b is not). Braces can be nested.
+  component (a/**/b is valid, a**b is not). Braces can be nested. A leading
+  ./ is ignored, so './src/*.rs' and 'src/*.rs' are the same pattern.
+  src/** matches everything under src/, not src itself.
 
 OPTIONS
 
   -r, --root <PATH>
-      Set the walk root directory. Patterns are relative to this path.
-      Default: current working directory.
+      Walk root. Patterns and excludes containing / are relative to it.
+      Output paths include the root as given. Default: current directory.
 
   -p, --paths
       Output plain file paths (one per line) instead of SIF.
 
   -s, --sif
-      Output SIF v1 document. This is the default.
+      Output a SIF v1 document. This is the default.
 
   -S, --summary
-      Append a §summary section with aggregate statistics: total files,
-      total bytes, total estimated tokens, kind breakdown, wall time,
-      and budget remaining (if a budget was set).
+      Append a §summary section: total files, dirs, bytes, estimated
+      tokens, kind breakdown, wall time, and budget remaining (if a
+      budget was set). SIF output only.
 
   -P, --preview <SPEC>
-      Append a §preview section with source lines from each matched file.
-      Three formats:
+      Append a §preview section with an excerpt of each matched text file.
+      SIF output only. Every number must be at least 1.
 
-        -P 10         First 10 lines (literal, includes comments/blanks).
-        -P 15-30      Lines 15 through 30 (1-indexed, inclusive range).
-        -P code:10    10 lines of code, skipping the leading comment block
-                      and blank lines. Jumps past // headers, # shebangs,
-                      /* block comments */, and blank lines to the first
-                      line of actual code.
+        -P 10         The first 10 lines.
+        -P 15-30      Lines 15 through 30 (1-indexed, inclusive).
+        -P code:10    10 consecutive lines starting at the first line of
+                      actual code. The leading preamble is skipped: blank
+                      lines, shebang, license headers, line and block
+                      comments, and docstrings, using the comment syntax
+                      of the file's language (so Rust #[derive] and C
+                      #include count as code, a Python # comment does not).
+                      Lines after the first line of code are shown as-is,
+                      comments included. A file with no code falls back to
+                      its first 10 lines.
 
-      Previews are emitted as SIF #block/#/block pairs with path and line
-      metadata. Binary files are skipped automatically.
+      Each excerpt is a SIF code block with language, file and lines
+      attributes; lines= is the exact 1-indexed range shown. Binary files
+      (by extension, or a NUL byte in the first 16 KB) are skipped.
 
   -a, --hidden
-      Include dotfiles and dot-directories in results. By default, entries
-      starting with '.' are hidden (matching POSIX FNM_PERIOD behavior).
+      Let wildcards match names starting with '.'. By default they don't
+      (POSIX FNM_PERIOD); a pattern component that starts with a literal
+      '.' (like .github/** or .env*) always matches.
 
   -d, --dirs
-      Only match directories. Files are excluded from results.
+      Only yield directories.
+
+  -L, --follow
+      Descend into symlinked directories found during the walk (cycles
+      are detected and skipped). By default they are listed but not
+      entered. A symlink named literally in the pattern is always followed.
 
   -e, --exclude <PATTERN>
-      Exclude files matching PATTERN. Can be repeated. Supports the same
-      glob syntax as include patterns. Excludes are applied after includes,
-      like .gitignore negation.
+      Exclude entries matching PATTERN. Repeatable; supports braces. A
+      pattern without / matches the file or directory name at any depth
+      (-e '*.md', -e node_modules). A pattern with / matches the path
+      relative to the root (-e 'docs/**', -e '**/generated/**'). An
+      excluded directory is skipped entirely, contents included.
 
   -g, --gitignore
-      Respect .gitignore files found during the walk. Loads .gitignore at
-      each directory level and filters entries accordingly. Also auto-
-      excludes .git/ directories. Handles negation patterns (! prefix).
+      Skip files ignored by git: .gitignore files (including those in
+      parent directories up to the repository root), .git/info/exclude,
+      and the global excludes file ($XDG_CONFIG_HOME/git/ignore or
+      ~/.config/git/ignore). Also skips .git/ directories. Directories
+      named literally at the start of the pattern are never skipped.
 
   -G, --git-changed [REF]
-      Only include files that have changed since REF. Uses git diff under
-      the hood. Includes uncommitted changes, staged changes, and untracked
-      files. Default REF: HEAD. Examples: -G main, -G HEAD~5, -G v1.0.0.
+      Only include files changed since REF: committed, staged, unstaged,
+      and untracked. Changes are measured from the merge base of REF and
+      HEAD, so -G main lists what this branch changed. Default REF: HEAD
+      (uncommitted work). An unknown REF is an error. The next argument
+      is taken as REF unless it starts with - or contains * ? [ — use
+      --git-changed=REF to be explicit. Examples: -G main, -G HEAD~5.
 
-  -n, --limit <N>
-      Stop after N matched results. The walk terminates early — directories
-      that would only produce results beyond the limit are never read.
+  -n, --limit <N | unlimited>
+      Stop after N results (N >= 1). Results are sorted, so this is the
+      first N paths in order; the walk stops as soon as they are found.
 
-  -t, --token-budget <N>
-      Stop when the cumulative estimated token count across all matched
-      files exceeds N. Tokens are estimated at ~3.5 bytes/token for files
-      with stat, or by extension heuristics in --no-stat mode. Accepts
-      size suffixes: 80K, 500K, 2M. The budget carries across brace-
-      expanded pattern variants.
+  -t, --token-budget <N | unlimited>
+      Stop at the first result that would push the estimated token total
+      over N (N > 0). Accepts suffixes: 80K, 1.5M. Estimates are size/3.5
+      (or per-extension medians with --no-stat).
 
-  --byte-budget <N>
-      Stop when cumulative matched file bytes exceed N. Accepts suffixes.
+  --byte-budget <N | unlimited>
+      Like --token-budget, for total file bytes.
 
   -k, --kind <KIND,...>
-      Filter results to files of the specified kind(s). Comma-separated.
-      Kinds: source, test, config, build, doc, data, generated, binary.
-      Example: -k source,config
+      Only yield files of the given kind(s). Comma-separated: source, test,
+      config, build, doc, data, generated, binary, unknown.
 
-  --depth <N>
-      Maximum recursion depth for ** patterns. Depth 1 returns only
-      immediate children of the walk root. Depth is counted from where
-      the ** starts, not from the filesystem root.
+  --depth <N | unlimited>
+      Maximum depth (N >= 1), counted from the first wildcard component:
+      '**' --depth 1 lists the root's immediate children; 'src/**/*.rs'
+      --depth 1 finds files directly in src/.
 
   --no-sort
-      Disable alphabetical sorting of results. Faster for large trees
-      when order doesn't matter.
+      Don't sort results. Slightly faster for large trees.
 
   --no-stat
-      Skip full stat() calls on each file. Uses DirEntry::file_type()
-      (free on Linux) and extension-based heuristics for token estimation.
-      SIF output omits size and tokens_est columns. Significantly faster
-      for large trees when you only need paths and kinds.
+      Skip stat() on each file: classification and extension-based token
+      estimates only. SIF output drops the size and tokens_est columns.
 
-OPTIONS (match)
+  --
+      Treat every following argument as a pattern.
 
-  -i, --ignore-case
-      Case-insensitive pattern matching (ASCII only).
+  -n, -t, --byte-budget and --depth never accept 0; `unlimited` (the
+  default) explicitly removes a cap, e.g. to override an earlier value.
+  Long options also accept --option=value. Kind, git-changed and exclude
+  filters are applied before limits and budgets are charged.
 
 EXAMPLES
 
   Basics:
     globber 'src/**/*.rs'                       Find all Rust files under src/
-    globber '**/*.{{rs,go,py}}' -r ~/project      Multi-language search with braces
+    globber '**/*.{rs,go,py}' -r ~/project      Multi-language search, one walk
     globber '**' --depth 1 -r ~/github          Shallow scan of a directory
 
   AI context packing:
@@ -540,28 +696,21 @@ EXAMPLES
     globber '**' -g -k source,config -S         Source + config files with summary
 
   Git workflow:
-    globber '**/*.rs' -G main                   Files changed since main branch
-    globber '**' -G HEAD -k source -P code:10   Preview uncommitted source changes
+    globber '**/*.rs' -G main                   Files this branch changed vs main
+    globber '**' -G -k source -P code:10        Preview uncommitted source changes
 
   Filtering:
-    globber '**/*.rs' -e '**/target/**'         Manual exclude
+    globber '**/*.rs' -e target -e '**/gen/**'  Manual excludes
     globber '**' -g -k source -p                Plain paths, gitignore-aware
     globber '**/*.rs' --no-stat -p              Fast listing without metadata
 
-  Pure matching (no filesystem):
-    globber match '*.rs' main.rs lib.rs         Test strings against a pattern
-    echo -e 'foo.rs\\nbar.py' | globber match '*.rs'
-
-  Brace expansion:
-    globber expand 'src/{{lib,main,util/{{a,b}}}}.rs'
-
 SIF OUTPUT
 
-  Default output is a SIF v1 document:
+  Default output is a SIF v1 document (records are tab-separated):
 
     #!sif v1
     #context File listing produced by globber
-    #schema path:str:path  size:uint  kind:str:311  tokens_est:uint  is_dir:bool
+    #schema path:str:path size:uint kind:enum(source,test,...) tokens_est:uint is_dir:bool
     src/main.rs     1024    source  293     false
     src/lib.rs      856     source  245     false
 
@@ -569,7 +718,7 @@ SIF OUTPUT
 
     ---
     §summary
-    #schema key:str:id  value:str
+    #schema key:str:id value:str
     total_files         42
     total_tokens_est    12400
     token_budget        80000
@@ -582,57 +731,35 @@ SIF OUTPUT
 
     ---
     §preview
-    #block code path=src/main.rs lines=8-17
+    #block code language=rust file=src/main.rs lines=8-17
     use std::env;
-    use std::process;
-    fn main() {{
-        let args = parse_args();
     ...
     #/block
-
-  The SIF output is directly consumable by sif-parser, SIL pipelines,
-  sif-scratch slots, and any SIF-aware toolchain.
 
 DESIGN
 
   Pattern engine     Thompson NFA simulation — O(pattern * input) worst case.
-                     Safe for untrusted and LLM-generated patterns. No
-                     exponential backtracking.
+                     Safe for untrusted and LLM-generated patterns. Brace
+                     expansion is capped at 10,000 alternatives.
 
-  Matching           POSIX fnmatch(3) semantics: *, ?, [...], [!...], \\escape.
-                     Extended with ** (recursive) and {{}} (brace expansion).
+  Walking            One engine for every walk. Each directory is read once
+                     and its children matched against all patterns at once.
+                     Literal components are stat()ed, not listed. Without a
+                     limit or budget, subdirectories fan out across threads
+                     (rayon); with one, the walk runs depth-first in sorted
+                     order and stops early. Both give identical output.
 
-  Walking            POSIX glob(3) model. Fast path: literal components skip
-                     readdir and go straight to stat. Recursive ** patterns
-                     use a fully parallel walker (rayon) that fans out readdir
-                     calls across threads. Sequential fallback for budget-
-                     limited walks requiring early termination.
+  Classification     Extension- and path-based FileKind inference (source,
+                     test, config, build, doc, data, generated, binary).
 
-  Parallelism        rayon thread pool. Parallel walker achieves 800-1000%
-                     CPU utilization on large trees. 430K files in ~1.4s.
-
-  Gitignore          Reads .gitignore at each directory level during the walk.
-                     Supports negation (! patterns). Auto-excludes .git/.
-
-  Classification     Extension-based FileKind inference (source, test, config,
-                     build, doc, data, generated, binary). Maps to SIF Classify
-                     codes (310=source, 312=test, 320=config, etc.).
-
-  Token estimation   Byte-based (size / 3.5) with stat, or extension-heuristic
-                     median file sizes without stat. Budget-precise to within
-                     ~600 tokens of a 500K budget.
-
-  Git integration    git diff --name-only for changed-file filtering. Covers
-                     committed, staged, and untracked changes.
-"
-    );
-}
+  Git integration    git merge-base + git diff + git ls-files.
+";
 
 // ── Entry point ──────────────────────────────────────────────────────
 
 fn main() {
-    let args = match parse_args() {
-        Ok(a) => a,
+    let command = match parse_args(env::args().skip(1).collect()) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("error: {}", e);
             eprintln!("try: globber --help");
@@ -640,9 +767,9 @@ fn main() {
         }
     };
 
-    let result = match args.command {
-        Command::Help => {
-            print_help();
+    let result = match command {
+        Command::Help(topic) => {
+            print_help(topic);
             Ok(())
         }
         Command::Version => {
@@ -651,14 +778,39 @@ fn main() {
         }
         Command::Glob(ga) => cmd_glob(ga),
         Command::Match(ma) => cmd_match(ma),
-        Command::Expand(pat) => {
-            cmd_expand(&pat);
-            Ok(())
-        }
+        Command::Expand(pat) => cmd_expand(&pat),
     };
 
     if let Err(e) = result {
         eprintln!("error: {}", e);
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn size_suffixes() {
+        assert_eq!(parse_size("500"), Ok(500));
+        assert_eq!(parse_size("80K"), Ok(80_000));
+        assert_eq!(parse_size("1.5M"), Ok(1_500_000));
+        assert_eq!(parse_size("2g"), Ok(2_000_000_000));
+        assert!(parse_size("99999999999999999999G").is_err());
+        assert!(parse_size("20000000000G").is_err());
+        assert!(parse_size("-1").is_err());
+        assert!(parse_size("K").is_err());
+        assert!(parse_size("1e400").is_err());
+    }
+
+    #[test]
+    fn counts_reject_zero() {
+        assert!(parse_count("-n", "0").is_err());
+        assert_eq!(parse_count("-n", "5"), Ok(Some(5)));
+        assert_eq!(parse_count("-n", "unlimited"), Ok(None));
+        assert!(parse_budget("-t", "0").is_err());
+        assert!(parse_budget("-t", "0K").is_err());
+        assert_eq!(parse_budget("-t", "unlimited"), Ok(None));
     }
 }

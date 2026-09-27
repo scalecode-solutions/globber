@@ -41,91 +41,57 @@ impl ChangedSet {
     }
 }
 
-/// Get the list of files changed since `ref_name` in the repo at `root`.
+/// Get the files changed since `ref_name` in the repo containing `root`:
+/// committed, staged, and unstaged changes, plus untracked files.
 ///
-/// Returns paths relative to the repo root.
+/// Changes are measured from the merge base of `ref_name` and `HEAD`, so
+/// `-G main` on a feature branch lists what the branch changed, not what
+/// landed on main since the branch forked. For an ancestor ref (`HEAD~3`,
+/// a release tag) the merge base is the ref itself.
+///
+/// Returns absolute paths. Fails if `ref_name` does not name a commit.
 pub fn changed_files(root: &Path, ref_name: &str) -> Result<Vec<PathBuf>, String> {
-    // Find the repo root.
     let repo_root = find_repo_root(root)?;
 
-    // Get files changed between ref and working tree (staged + unstaged + untracked).
-    let mut paths = Vec::new();
+    let commit = git(&repo_root, &["rev-parse", "--verify", "--quiet", &format!("{}^{{commit}}", ref_name)])
+        .map_err(|_| format!("unknown git ref: {}", ref_name))?;
+    let base = git(&repo_root, &["merge-base", &commit, "HEAD"]).unwrap_or(commit);
 
-    // Diff against the ref (committed changes on this branch).
-    let output = Command::new("git")
-        .args(["diff", "--name-only", ref_name])
-        .current_dir(&repo_root)
-        .output()
-        .map_err(|e| format!("failed to run git: {}", e))?;
+    // -z: raw paths, no quoting of unusual characters.
+    let diff = git(&repo_root, &["diff", "--name-only", "-z", &base])?;
+    let untracked = git(&repo_root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if !line.is_empty() {
-                paths.push(repo_root.join(line));
-            }
-        }
-    }
-
-    // Also include staged but not yet committed.
-    let output = Command::new("git")
-        .args(["diff", "--name-only", "--cached"])
-        .current_dir(&repo_root)
-        .output()
-        .map_err(|e| format!("failed to run git: {}", e))?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if !line.is_empty() {
-                let p = repo_root.join(line);
-                if !paths.contains(&p) {
-                    paths.push(p);
-                }
-            }
-        }
-    }
-
-    // Also include untracked files.
-    let output = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .current_dir(&repo_root)
-        .output()
-        .map_err(|e| format!("failed to run git: {}", e))?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if !line.is_empty() {
-                let p = repo_root.join(line);
-                if !paths.contains(&p) {
-                    paths.push(p);
-                }
-            }
-        }
-    }
-
+    let mut paths: Vec<PathBuf> = diff
+        .split('\0')
+        .chain(untracked.split('\0'))
+        .filter(|l| !l.is_empty())
+        .map(|l| repo_root.join(l))
+        .collect();
     paths.sort();
+    paths.dedup();
     Ok(paths)
 }
 
 /// Find the git repository root from a given path.
 fn find_repo_root(from: &Path) -> Result<PathBuf, String> {
+    git(from, &["rev-parse", "--show-toplevel"])
+        .map(|s| PathBuf::from(s.trim_end()))
+        .map_err(|_| format!("not a git repository: {}", from.display()))
+}
+
+/// Run git in `dir`, returning stdout, or stderr as the error.
+fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(from)
+        .args(args)
+        .current_dir(dir)
         .output()
         .map_err(|e| format!("failed to run git: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "not a git repository: {}",
-            from.display()
-        ));
+    if output.status.success() {
+        let out = String::from_utf8_lossy(&output.stdout).into_owned();
+        Ok(if args.contains(&"-z") { out } else { out.trim().to_string() })
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
-
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(PathBuf::from(root))
 }
 
 #[cfg(test)]

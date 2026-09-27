@@ -82,8 +82,8 @@
 //! let sif = globber::to_sif(&entries);
 //! println!("{}", sif);
 //! // #!sif v1
-//! // #schema path:str:path	size:uint	kind:str:311	tokens_est:uint	is_dir:bool
-//! // src/main.rs	1024	source	293	false
+//! // #schema path:str:path size:uint kind:enum(source,...) tokens_est:uint is_dir:bool
+//! // src/main.rs<TAB>1024<TAB>source<TAB>293<TAB>false
 //! // ...
 //! ```
 //!
@@ -105,6 +105,7 @@ pub mod entry;
 pub mod walker;
 pub mod ruleset;
 pub mod sif_output;
+pub mod preview;
 pub mod git;
 mod ignore;
 
@@ -116,7 +117,11 @@ pub use matcher::MatchOptions;
 pub use entry::{Entry, FileKind};
 pub use walker::{BudgetMode, EntryFilter, WalkOptions, WalkResult, walk, walk_many};
 pub use ruleset::Ruleset;
-pub use sif_output::{to_sif, to_sif_with_summary, to_sif_with_summary_and_budget, to_paths, write_preview, BudgetInfo, PreviewMode};
+pub use sif_output::{
+    to_paths, to_sif, to_sif_with, to_sif_with_summary, to_sif_with_summary_and_budget, write_sif,
+    write_sif_with, BudgetInfo, SifOptions,
+};
+pub use preview::{write_preview, PreviewMode};
 
 // ── Convenience functions ────────────────────────────────────────────
 

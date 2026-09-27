@@ -5,7 +5,7 @@
 //
 // Output schema:
 //   #!sif v1
-//   #schema path:str:path size:uint kind:str:311 tokens_est:uint is_dir:bool
+//   #schema path:str:path size:uint kind:enum(...) tokens_est:uint is_dir:bool
 //
 // This lets any SIF-aware tool (sif-parser, SIL pipelines, STP tools,
 // sif-scratch slots) consume glob results directly.
@@ -14,240 +14,145 @@ use std::fmt::Write;
 
 use crate::entry::Entry;
 
+/// The `kind` column type: every [`FileKind`](crate::FileKind) name.
+const KIND_ENUM: &str = "enum(source,test,config,build,doc,data,generated,binary,unknown)";
+
+/// Options for SIF emission.
+#[derive(Debug, Clone, Default)]
+pub struct SifOptions {
+    /// Entries came from a `no_stat` walk: omit the size and token columns
+    /// (they would be zeros and guesses) and the byte/token totals.
+    pub no_stat: bool,
+    /// Append a §summary section with these budget figures.
+    pub summary: Option<BudgetInfo>,
+}
+
+/// Budget and timing figures for the §summary section.
+#[derive(Debug, Clone, Default)]
+pub struct BudgetInfo {
+    /// Token budget, if one was set.
+    pub token_budget: Option<u64>,
+    /// Byte budget, if one was set.
+    pub byte_budget: Option<u64>,
+    /// Wall-clock time of the walk. 0 = omit.
+    pub wall_time_ms: u64,
+    /// Directories that could not be read during the walk.
+    pub unreadable_dirs: usize,
+}
+
 /// Format a list of entries as a SIF document string.
 ///
 /// Output is a complete SIF v1 document with schema and records.
 /// Each entry becomes one tab-separated record.
 pub fn to_sif(entries: &[Entry]) -> String {
-    let mut buf = String::with_capacity(entries.len() * 80);
-    write_sif(entries, &mut buf).unwrap();
-    buf
-}
-
-/// Write entries as SIF to any fmt::Write sink.
-pub fn write_sif(entries: &[Entry], w: &mut dyn Write) -> std::fmt::Result {
-    // Detect no-stat mode: if all sizes are 0 and entries exist, omit size/tokens columns.
-    let has_stat = entries.is_empty() || entries.iter().any(|e| e.size > 0 || e.is_dir);
-
-    writeln!(w, "#!sif v1")?;
-    writeln!(w, "#context File listing produced by globber")?;
-
-    if has_stat {
-        writeln!(
-            w,
-            "#schema path:str:path\tsize:uint\tkind:str:311\ttokens_est:uint\tis_dir:bool"
-        )?;
-        for entry in entries {
-            writeln!(
-                w, "{}\t{}\t{}\t{}\t{}",
-                entry.path.display(), entry.size, entry.kind.as_str(),
-                entry.tokens_est, entry.is_dir,
-            )?;
-        }
-    } else {
-        writeln!(w, "#schema path:str:path\tkind:str:311\tis_dir:bool")?;
-        for entry in entries {
-            writeln!(
-                w, "{}\t{}\t{}",
-                entry.path.display(), entry.kind.as_str(), entry.is_dir,
-            )?;
-        }
-    }
-
-    Ok(())
+    to_sif_with(entries, &SifOptions::default())
 }
 
 /// Format entries as a SIF document with a summary section.
-///
-/// Includes a second section with aggregate statistics useful for
-/// AI agents planning context acquisition.
-/// Budget information for the summary section.
-#[derive(Debug, Default)]
-pub struct BudgetInfo {
-    pub token_budget: u64,
-    pub byte_budget: u64,
-    pub wall_time_ms: u64,
-}
-
 pub fn to_sif_with_summary(entries: &[Entry]) -> String {
     to_sif_with_summary_and_budget(entries, &BudgetInfo::default())
 }
 
 /// Format entries as a SIF document with a summary section and budget info.
 pub fn to_sif_with_summary_and_budget(entries: &[Entry], budget: &BudgetInfo) -> String {
-    let mut buf = String::with_capacity(entries.len() * 80 + 512);
-    write_sif(entries, &mut buf).unwrap();
+    to_sif_with(
+        entries,
+        &SifOptions { summary: Some(budget.clone()), ..SifOptions::default() },
+    )
+}
 
-    // Summary section.
+/// Format entries as a SIF document with explicit options.
+pub fn to_sif_with(entries: &[Entry], opts: &SifOptions) -> String {
+    let mut buf = String::with_capacity(entries.len() * 80 + 512);
+    write_sif_with(entries, opts, &mut buf).unwrap();
+    buf
+}
+
+/// Write entries as SIF to any fmt::Write sink.
+pub fn write_sif(entries: &[Entry], w: &mut dyn Write) -> std::fmt::Result {
+    write_sif_with(entries, &SifOptions::default(), w)
+}
+
+/// Write entries as SIF with explicit options.
+pub fn write_sif_with(entries: &[Entry], opts: &SifOptions, w: &mut dyn Write) -> std::fmt::Result {
+    writeln!(w, "#!sif v1")?;
+    writeln!(w, "#context File listing produced by globber")?;
+
+    if opts.no_stat {
+        writeln!(w, "#schema path:str:path kind:{} is_dir:bool", KIND_ENUM)?;
+        for e in entries {
+            writeln!(w, "{}\t{}\t{}", sif_str(&e.path.to_string_lossy()), e.kind, e.is_dir)?;
+        }
+    } else {
+        writeln!(
+            w,
+            "#schema path:str:path size:uint kind:{} tokens_est:uint is_dir:bool",
+            KIND_ENUM
+        )?;
+        for e in entries {
+            writeln!(
+                w,
+                "{}\t{}\t{}\t{}\t{}",
+                sif_str(&e.path.to_string_lossy()),
+                e.size,
+                e.kind,
+                e.tokens_est,
+                e.is_dir,
+            )?;
+        }
+    }
+
+    if let Some(budget) = &opts.summary {
+        write_summary(entries, budget, opts.no_stat, w)?;
+    }
+    Ok(())
+}
+
+fn write_summary(
+    entries: &[Entry],
+    budget: &BudgetInfo,
+    no_stat: bool,
+    w: &mut dyn Write,
+) -> std::fmt::Result {
     let total_files = entries.iter().filter(|e| !e.is_dir).count();
     let total_dirs = entries.iter().filter(|e| e.is_dir).count();
     let total_bytes: u64 = entries.iter().map(|e| e.size).sum();
     let total_tokens: u64 = entries.iter().map(|e| e.tokens_est).sum();
 
-    // Count by kind.
-    let mut kind_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
-    for entry in entries {
-        if !entry.is_dir {
-            *kind_counts.entry(entry.kind.as_str()).or_insert(0) += 1;
-        }
+    let mut kind_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for entry in entries.iter().filter(|e| !e.is_dir) {
+        *kind_counts.entry(entry.kind.as_str()).or_insert(0) += 1;
     }
 
-    writeln!(buf, "---").unwrap();
-    writeln!(buf, "§summary").unwrap();
-    writeln!(buf, "#schema key:str:id value:str").unwrap();
-    writeln!(buf, "total_files\t{}", total_files).unwrap();
-    writeln!(buf, "total_dirs\t{}", total_dirs).unwrap();
-    writeln!(buf, "total_bytes\t{}", total_bytes).unwrap();
-    writeln!(buf, "total_tokens_est\t{}", total_tokens).unwrap();
-
-    if budget.token_budget > 0 {
-        let remaining = budget.token_budget.saturating_sub(total_tokens);
-        writeln!(buf, "token_budget\t{}", budget.token_budget).unwrap();
-        writeln!(buf, "token_budget_remaining\t{}", remaining).unwrap();
+    writeln!(w, "---")?;
+    writeln!(w, "§summary")?;
+    writeln!(w, "#schema key:str:id value:str")?;
+    writeln!(w, "total_files\t{}", total_files)?;
+    writeln!(w, "total_dirs\t{}", total_dirs)?;
+    if !no_stat {
+        writeln!(w, "total_bytes\t{}", total_bytes)?;
+        writeln!(w, "total_tokens_est\t{}", total_tokens)?;
     }
-    if budget.byte_budget > 0 {
-        let remaining = budget.byte_budget.saturating_sub(total_bytes);
-        writeln!(buf, "byte_budget\t{}", budget.byte_budget).unwrap();
-        writeln!(buf, "byte_budget_remaining\t{}", remaining).unwrap();
+    if let Some(b) = budget.token_budget {
+        writeln!(w, "token_budget\t{}", b)?;
+        writeln!(w, "token_budget_remaining\t{}", b.saturating_sub(total_tokens))?;
+    }
+    if let Some(b) = budget.byte_budget {
+        writeln!(w, "byte_budget\t{}", b)?;
+        writeln!(w, "byte_budget_remaining\t{}", b.saturating_sub(total_bytes))?;
+    }
+    if budget.unreadable_dirs > 0 {
+        writeln!(w, "unreadable_dirs\t{}", budget.unreadable_dirs)?;
     }
     if budget.wall_time_ms > 0 {
-        writeln!(buf, "wall_time_ms\t{}", budget.wall_time_ms).unwrap();
+        writeln!(w, "wall_time_ms\t{}", budget.wall_time_ms)?;
     }
 
     let mut kinds: Vec<_> = kind_counts.into_iter().collect();
-    kinds.sort_by(|a, b| b.1.cmp(&a.1));
+    kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     for (kind, count) in kinds {
-        writeln!(buf, "kind_{}\t{}", kind, count).unwrap();
+        writeln!(w, "kind_{}\t{}", kind, count)?;
     }
-
-    buf
-}
-
-/// Preview mode — controls which lines are included in §preview blocks.
-#[derive(Debug, Clone)]
-pub enum PreviewMode {
-    /// First N lines (literal). `-P 10`
-    Head(usize),
-    /// Line range (1-indexed, inclusive). `-P 15-30`
-    Range(usize, usize),
-    /// N lines of code, skipping leading comments and blanks. `-P code:10`
-    Code(usize),
-}
-
-impl PreviewMode {
-    /// Parse a preview spec string.
-    ///
-    /// Formats: `10`, `15-30`, `code:10`
-    pub fn parse(s: &str) -> Result<Self, String> {
-        if let Some(rest) = s.strip_prefix("code:") {
-            let n: usize = rest.parse().map_err(|_| format!("invalid number: {}", rest))?;
-            Ok(PreviewMode::Code(n))
-        } else if let Some((a, b)) = s.split_once('-') {
-            let start: usize = a.parse().map_err(|_| format!("invalid range start: {}", a))?;
-            let end: usize = b.parse().map_err(|_| format!("invalid range end: {}", b))?;
-            if start == 0 || end == 0 || end < start {
-                return Err(format!("invalid range: {}-{} (1-indexed, end >= start)", start, end));
-            }
-            Ok(PreviewMode::Range(start, end))
-        } else {
-            let n: usize = s.parse().map_err(|_| format!("invalid preview spec: {}", s))?;
-            Ok(PreviewMode::Head(n))
-        }
-    }
-}
-
-/// Append a §preview section with lines of each non-binary file.
-pub fn write_preview(
-    entries: &[Entry],
-    mode: &PreviewMode,
-    w: &mut dyn Write,
-) -> std::fmt::Result {
-    use crate::entry::FileKind;
-    use std::io::BufRead;
-
-    writeln!(w, "---")?;
-    writeln!(w, "§preview")?;
-
-    for entry in entries {
-        if entry.is_dir || entry.kind == FileKind::Binary {
-            continue;
-        }
-
-        let file = match std::fs::File::open(&entry.path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let reader = std::io::BufReader::new(file);
-
-        let (preview_lines, line_start) = match mode {
-            PreviewMode::Head(n) => {
-                let lines: Vec<String> = reader
-                    .lines()
-                    .take(*n)
-                    .filter_map(|l| l.ok())
-                    .collect();
-                (lines, 1usize)
-            }
-            PreviewMode::Range(start, end) => {
-                let lines: Vec<String> = reader
-                    .lines()
-                    .enumerate()
-                    .skip(start - 1)
-                    .take(end - start + 1)
-                    .filter_map(|(_, l)| l.ok())
-                    .collect();
-                (lines, *start)
-            }
-            PreviewMode::Code(n) => {
-                // Skip leading comment lines (// or #! or blank) then take N lines.
-                let all_lines: Vec<String> = reader
-                    .lines()
-                    .filter_map(|l| l.ok())
-                    .collect();
-
-                let skip = all_lines
-                    .iter()
-                    .position(|l| {
-                        let trimmed = l.trim();
-                        !trimmed.is_empty()
-                            && !trimmed.starts_with("//")
-                            && !trimmed.starts_with('#')
-                            && !trimmed.starts_with("/*")
-                            && !trimmed.starts_with('*')
-                            && !trimmed.starts_with("--")
-                            && !trimmed.starts_with("'''")
-                            && !trimmed.starts_with("\"\"\"")
-                    })
-                    .unwrap_or(0);
-
-                let lines: Vec<String> = all_lines
-                    .into_iter()
-                    .skip(skip)
-                    .take(*n)
-                    .collect();
-                (lines, skip + 1)
-            }
-        };
-
-        if preview_lines.is_empty() {
-            continue;
-        }
-
-        let line_end = line_start + preview_lines.len() - 1;
-        writeln!(
-            w,
-            "#block code path={} lines={}-{}",
-            entry.path.display(),
-            line_start,
-            line_end,
-        )?;
-        for line in &preview_lines {
-            writeln!(w, "{}", line)?;
-        }
-        writeln!(w, "#/block")?;
-    }
-
     Ok(())
 }
 
@@ -258,6 +163,55 @@ pub fn to_paths(entries: &[Entry]) -> String {
         writeln!(buf, "{}", entry.path.display()).unwrap();
     }
     buf
+}
+
+// ── Value quoting (SIF Core §10–11) ──────────────────────────────────
+
+/// Render a string field value, quoting it when the unquoted form would
+/// be ambiguous: SIF unquoted strings cannot contain tabs, commas,
+/// brackets, braces or quotes, cannot start or end with a space, and a
+/// record must not look like a directive, section break, or null.
+pub(crate) fn sif_str(s: &str) -> String {
+    let safe = |c: char| {
+        !c.is_control() && !matches!(c, ',' | '[' | ']' | '{' | '}' | '"' | '\\')
+    };
+    let needs_quotes = s.is_empty()
+        || s == "_"
+        || s == "---"
+        || s.starts_with('#')
+        || s.starts_with('§')
+        || s.starts_with(' ')
+        || s.ends_with(' ')
+        || !s.chars().all(safe);
+    if needs_quotes { quote(s) } else { s.to_string() }
+}
+
+/// Render a directive attribute value (`key=value`), quoting it unless it
+/// is plain visible ASCII with no `=`.
+pub(crate) fn sif_attr(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'=' && b != b'"' && b != b'\\');
+    if plain { s.to_string() } else { quote(s) }
+}
+
+fn quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
@@ -297,10 +251,35 @@ mod tests {
     }
 
     #[test]
+    fn schema_fields_are_space_separated() {
+        let sif = to_sif(&sample_entries());
+        let schema = sif.lines().find(|l| l.starts_with("#schema")).unwrap();
+        assert!(!schema.contains('\t'));
+        assert!(schema.contains(" kind:enum(source,"));
+    }
+
+    #[test]
     fn sif_output_has_records() {
         let sif = to_sif(&sample_entries());
         assert!(sif.contains("src/main.rs\t1024\tsource\t293\tfalse"));
         assert!(sif.contains("Cargo.toml\t256\tconfig\t74\tfalse"));
+    }
+
+    #[test]
+    fn no_stat_schema_is_explicit() {
+        let sif = to_sif_with(&sample_entries(), &SifOptions { no_stat: true, summary: None });
+        assert!(sif.contains("#schema path:str:path kind:"));
+        assert!(sif.contains("src/main.rs\tsource\tfalse"));
+    }
+
+    #[test]
+    fn empty_files_keep_full_schema() {
+        let mut entries = sample_entries();
+        for e in &mut entries {
+            e.size = 0;
+            e.tokens_est = 0;
+        }
+        assert!(to_sif(&entries).contains("tokens_est:uint"));
     }
 
     #[test]
@@ -315,5 +294,26 @@ mod tests {
     fn plain_paths() {
         let out = to_paths(&sample_entries());
         assert_eq!(out, "src/main.rs\nCargo.toml\n");
+    }
+
+    #[test]
+    fn str_quoting() {
+        assert_eq!(sif_str("src/main.rs"), "src/main.rs");
+        assert_eq!(sif_str("with space.rs"), "with space.rs");
+        assert_eq!(sif_str("a,b.rs"), "\"a,b.rs\"");
+        assert_eq!(sif_str("{x}.rs"), "\"{x}.rs\"");
+        assert_eq!(sif_str("tab\there"), "\"tab\\there\"");
+        assert_eq!(sif_str("#notes"), "\"#notes\"");
+        assert_eq!(sif_str("_"), "\"_\"");
+        assert_eq!(sif_str(" lead"), "\" lead\"");
+        assert_eq!(sif_str("日本.rs"), "日本.rs");
+    }
+
+    #[test]
+    fn attr_quoting() {
+        assert_eq!(sif_attr("src/main.rs"), "src/main.rs");
+        assert_eq!(sif_attr("my file.rs"), "\"my file.rs\"");
+        assert_eq!(sif_attr("a=b"), "\"a=b\"");
+        assert_eq!(sif_attr("日本.rs"), "\"日本.rs\"");
     }
 }
