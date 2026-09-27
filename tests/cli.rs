@@ -794,3 +794,49 @@ fn skipped_rows_option() {
     ), "{}", stderr(&out));
     assert_eq!(globber(d, &["**", "--max-output-tokens", "0"]).status.code(), Some(2));
 }
+
+// ── Non-UTF-8 names (Linux only: APFS refuses them) ─────────────────
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_paths_exact_bytes_with_p_and_counted_in_sif() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join(std::ffi::OsStr::from_bytes(b"bad\xff.rs")), "x").unwrap();
+    let out = globber(dir.path(), &["*.rs", "-p"]);
+    assert_eq!(out.stdout, b"bad\xff.rs\n");
+    let out = stdout(&globber(dir.path(), &["*.rs", "-S"]));
+    assert!(out.contains("bad\u{fffd}.rs\t"));
+    assert!(out.contains("non_utf8_names\t1\t"));
+}
+
+// ── Deleted files under -G ──────────────────────────────────────────
+
+#[test]
+fn git_changed_reports_deleted_files() {
+    let dir = project();
+    let d = dir.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-qm", "init"]);
+    fs::remove_file(d.join("src/lib.rs")).unwrap();
+    fs::remove_file(d.join("README.md")).unwrap();
+    write(d, "src/main.rs", "changed");
+
+    let out = stdout(&globber(d, &["src/**/*.rs", "-G", "-S"]));
+    assert!(out.contains("src/main.rs\t"));
+    assert!(out.contains("§deleted\n#context Changed since HEAD but deleted from the working tree\n"), "{}", out);
+    assert!(out.contains("\nsrc/lib.rs\tsource\n"));
+    // README.md doesn't match the pattern, so it isn't reported.
+    assert!(!out.contains("README.md"));
+    assert!(out.contains("git_deleted\t1\t"));
+
+    let out = globber(d, &["src/**/*.rs", "-G", "-p"]);
+    assert_eq!(lines(&out), vec!["src/main.rs"]);
+    assert!(stderr(&out).contains("1 matching file(s) changed since HEAD were deleted: src/lib.rs"));
+
+    // -k applies to deleted files too.
+    let out = stdout(&globber(d, &["**", "-G", "-k", "doc", "-S"]));
+    assert!(out.contains("\nREADME.md\tdoc\n"));
+    assert!(!out.contains("src/lib.rs"));
+}

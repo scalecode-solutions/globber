@@ -83,8 +83,8 @@ impl IgnoreFile {
             joined = self.prefix.join(rel);
             &joined
         };
-        let rel_str = rel.to_str()?;
-        let name = rel.file_name()?.to_str()?;
+        let rel_str = &*rel.to_string_lossy();
+        let name = &*rel.file_name()?.to_string_lossy();
         self.rules.iter().rev().find_map(|rule| {
             if rule.dir_only && !is_dir {
                 return None;

@@ -42,6 +42,11 @@ pub struct SifOptions {
     pub skipped_rows: Option<usize>,
     /// Append a §preview section.
     pub preview: Option<PreviewMode>,
+    /// Files changed since a `-G` ref but deleted from the working tree,
+    /// listed in a §deleted section (paths as the walk would spell them).
+    pub deleted: Vec<std::path::PathBuf>,
+    /// The `-G` ref, for the §deleted context line.
+    pub deleted_since: Option<String>,
     /// Cap on the estimated tokens of the whole document. When the
     /// document would exceed it, previews are shortened, then dropped,
     /// then §skipped rows, then records — each marked with `#truncated`.
@@ -59,6 +64,8 @@ impl Default for SifOptions {
             budget_skipped: Vec::new(),
             skipped_rows: Some(DEFAULT_SKIPPED_ROWS),
             preview: None,
+            deleted: Vec::new(),
+            deleted_since: None,
             max_output_tokens: None,
         }
     }
@@ -385,6 +392,20 @@ fn render(
         }
     }
 
+    if !opts.deleted.is_empty() {
+        let _ = writeln!(w, "---");
+        let _ = writeln!(w, "§deleted");
+        let _ = writeln!(
+            w,
+            "#context Changed since {} but deleted from the working tree",
+            opts.deleted_since.as_deref().unwrap_or("the ref")
+        );
+        let _ = writeln!(w, "#schema path:str:path kind:{}", KIND_ENUM);
+        for p in &opts.deleted {
+            let _ = writeln!(w, "{}\t{}", sif_str(&p.to_string_lossy()), crate::entry::FileKind::infer(p));
+        }
+    }
+
     if let Some(blocks) = blocks {
         let _ = writeln!(w, "---");
         let _ = writeln!(w, "§preview");
@@ -489,6 +510,12 @@ fn write_summary(
         ("filtered_git_changed", budget.filtered_git_changed, "matches unchanged since the -G ref"),
         ("unreadable_dirs", budget.unreadable_dirs, "directories that could not be read"),
         ("preview_skipped_binary", binary_skipped, "binary files are not previewed"),
+        ("git_deleted", opts.deleted.len(), "changed since the -G ref but deleted; listed in §deleted"),
+        (
+            "non_utf8_names",
+            p.non_utf8_names,
+            "paths that aren't UTF-8, shown with U+FFFD here; -p prints the exact bytes",
+        ),
     ] {
         if count > 0 {
             let _ = writeln!(w, "{}\t{}\t{}", key, count, note);

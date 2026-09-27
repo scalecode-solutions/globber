@@ -16,6 +16,7 @@ use std::process::Command;
 pub struct ChangedSet {
     names: HashSet<OsString>,
     paths: HashSet<PathBuf>,
+    deleted: Vec<PathBuf>,
 }
 
 impl ChangedSet {
@@ -25,9 +26,22 @@ impl ChangedSet {
             if let Some(name) = p.file_name() {
                 set.names.insert(name.to_os_string());
             }
-            set.paths.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
+            match std::fs::canonicalize(p) {
+                Ok(c) => {
+                    set.paths.insert(c);
+                }
+                // Changed but gone from the working tree: a deletion.
+                Err(_) => set.deleted.push(p.clone()),
+            }
         }
         set
+    }
+
+    /// Changed files that no longer exist in the working tree (absolute
+    /// paths). A walk can never list these, so callers report them
+    /// separately.
+    pub fn deleted(&self) -> &[PathBuf] {
+        &self.deleted
     }
 
     /// Whether `path` (relative to the cwd, or absolute) is a changed file.
@@ -58,14 +72,14 @@ pub fn changed_files(root: &Path, ref_name: &str) -> Result<Vec<PathBuf>, String
     let base = git(&repo_root, &["merge-base", &commit, "HEAD"]).unwrap_or(commit);
 
     // -z: raw paths, no quoting of unusual characters.
-    let diff = git(&repo_root, &["diff", "--name-only", "-z", &base])?;
-    let untracked = git(&repo_root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let diff = git_bytes(&repo_root, &["diff", "--name-only", "-z", &base])?;
+    let untracked = git_bytes(&repo_root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
 
     let mut paths: Vec<PathBuf> = diff
-        .split('\0')
-        .chain(untracked.split('\0'))
+        .split(|&b| b == 0)
+        .chain(untracked.split(|&b| b == 0))
         .filter(|l| !l.is_empty())
-        .map(|l| repo_root.join(l))
+        .map(|l| repo_root.join(bytes_to_path(l)))
         .collect();
     paths.sort();
     paths.dedup();
@@ -90,24 +104,24 @@ pub(crate) fn list_files(dir: &Path, nested: bool) -> Result<Vec<(PathBuf, bool)
             e
         }
     };
-    let tracked = git(dir, &["ls-files", "--cached", "-z"]).map_err(not_repo)?;
-    let untracked = git(dir, &["ls-files", "--others", "--exclude-standard", "-z"]).map_err(not_repo)?;
+    let tracked = git_bytes(dir, &["ls-files", "--cached", "-z"]).map_err(not_repo)?;
+    let untracked = git_bytes(dir, &["ls-files", "--others", "--exclude-standard", "-z"]).map_err(not_repo)?;
     let submodules = submodule_paths(dir);
 
     let mut files = Vec::new();
     let mut nested_dirs = Vec::new();
     let listed = tracked
-        .split('\0')
+        .split(|&b| b == 0)
         .map(|p| (p, true))
-        .chain(untracked.split('\0').map(|p| (p, false)));
+        .chain(untracked.split(|&b| b == 0).map(|p| (p, false)));
     for (p, is_tracked) in listed.filter(|(p, _)| !p.is_empty()) {
-        if let Some(d) = p.strip_suffix('/') {
+        if let Some(d) = p.strip_suffix(b"/") {
             // Untracked nested repository: git lists it, not its contents.
-            nested_dirs.push(PathBuf::from(d));
-        } else if is_tracked && submodules.iter().any(|s| s == Path::new(p)) {
-            nested_dirs.push(PathBuf::from(p));
+            nested_dirs.push(bytes_to_path(d));
+        } else if is_tracked && submodules.iter().any(|s| *s == bytes_to_path(p)) {
+            nested_dirs.push(bytes_to_path(p));
         } else {
-            files.push((PathBuf::from(p), is_tracked));
+            files.push((bytes_to_path(p), is_tracked));
         }
     }
 
@@ -153,6 +167,33 @@ fn find_repo_root(from: &Path) -> Result<PathBuf, String> {
     git(from, &["rev-parse", "--show-toplevel"])
         .map(|s| PathBuf::from(s.trim_end()))
         .map_err(|_| format!("not a git repository: {}", from.display()))
+}
+
+/// A path from git's raw `-z` output, keeping non-UTF-8 bytes on Unix.
+fn bytes_to_path(b: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(b))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(b).into_owned())
+    }
+}
+
+/// Run git in `dir`, returning raw stdout, or stderr as the error.
+fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("failed to run git: {}", e))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 /// Run git in `dir`, returning stdout, or stderr as the error.

@@ -80,14 +80,16 @@ impl FileKind {
     /// directories and names, generated/lock files, then by name and
     /// extension.
     pub fn infer(path: &Path) -> Self {
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
+        let name = match path.file_name() {
+            Some(n) => n.to_string_lossy(),
             None => return FileKind::Unknown,
         };
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let name = &*name;
+        let ext = path.extension().map(|e| e.to_string_lossy()).unwrap_or_default();
+        let ext = &*ext;
         let in_dir = |dirs: &[&str]| {
             path.parent().is_some_and(|p| {
-                p.components().any(|c| c.as_os_str().to_str().is_some_and(|c| dirs.contains(&c)))
+                p.components().any(|c| dirs.contains(&&*c.as_os_str().to_string_lossy()))
             })
         };
 

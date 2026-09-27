@@ -435,3 +435,24 @@ fn report_lists_fit_skips_and_stop_reason() {
     assert_eq!(report.stopped_early, Some(globber::StopReason::TokenBudget));
     assert!(report.budget_skipped.is_empty());
 }
+
+// macOS (APFS) refuses non-UTF-8 names, so this only runs on Linux.
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_names_are_listed_and_counted() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bad = std::ffi::OsStr::from_bytes(b"bad\xff.rs");
+    fs::write(dir.path().join(bad), "x").unwrap();
+    fs::write(dir.path().join("good.rs"), "x").unwrap();
+    let pat = format!("{}/*.rs", dir.path().display());
+    let report = globber::walk_many_report(&[&pat], WalkOptions::default()).unwrap();
+    let names: Vec<_> = report
+        .results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|e| e.path.file_name().unwrap().to_os_string())
+        .collect();
+    assert_eq!(names, vec![bad.to_os_string(), "good.rs".into()]);
+    assert_eq!(report.pruned.non_utf8_names, 1);
+}

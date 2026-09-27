@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use globber::{
-    to_paths, to_sif_with, BudgetInfo, BudgetMode, Prefer, Entry, EntryFilter, FileKind, MatchOptions, PreviewMode,
+    to_sif_with, BudgetInfo, BudgetMode, Prefer, Entry, EntryFilter, FileKind, MatchOptions, PreviewMode,
     SifOptions, WalkOptions,
 };
 
@@ -458,6 +458,10 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
         }
         None => None,
     };
+    let deleted = match &changed {
+        Some(c) => deleted_matches(c.deleted(), &patterns, &ga),
+        None => Vec::new(),
+    };
     let kinds = ga.kind_filter.clone();
     let filtered_kind = Arc::new(AtomicUsize::new(0));
     let filtered_changed = Arc::new(AtomicUsize::new(0));
@@ -553,13 +557,29 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
 
     let output = match ga.format {
         OutputFormat::Paths => {
-            // Paths feed other programs, so they are capped only on request.
-            let mut out = to_paths(&entries);
+            if !deleted.is_empty() {
+                let shown: Vec<String> = deleted.iter().take(5).map(|p| p.display().to_string()).collect();
+                let more = if deleted.len() > 5 { format!(" (and {} more)", deleted.len() - 5) } else { String::new() };
+                eprintln!(
+                    "note: {} matching file(s) changed since {} were deleted: {}{}",
+                    deleted.len(),
+                    ga.git_changed.as_deref().unwrap_or("HEAD"),
+                    shown.join(", "),
+                    more
+                );
+            }
+            // Paths feed other programs: write exact bytes (non-UTF-8 names
+            // included), capped only on request.
+            let mut out: Vec<u8> = Vec::new();
+            for e in &entries {
+                out.extend_from_slice(path_bytes(&e.path).as_ref());
+                out.push(b'\n');
+            }
             if let Some(Some(cap)) = ga.max_output_tokens {
                 let max_bytes = (cap as usize).saturating_mul(7) / 2;
                 if out.len() > max_bytes {
-                    let cut = out[..max_bytes].rfind('\n').map_or(0, |i| i + 1);
-                    let shown = out[..cut].lines().count();
+                    let cut = out[..max_bytes].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+                    let shown = out[..cut].iter().filter(|&&b| b == b'\n').count();
                     out.truncate(cut);
                     eprintln!(
                         "note: output truncated to {} of {} paths by --max-output-tokens {}; use --max-output-tokens unlimited",
@@ -569,7 +589,10 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
                     );
                 }
             }
-            out
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&out).map_err(|e| e.to_string())?;
+            return Ok(());
         }
         OutputFormat::Sif => {
             let summary = ga.summary.then(|| BudgetInfo {
@@ -596,6 +619,8 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
                 budget_skipped: report.budget_skipped,
                 skipped_rows: ga.skipped_rows,
                 preview: ga.preview.clone(),
+                deleted,
+                deleted_since: ga.git_changed.clone(),
                 max_output_tokens: ga.max_output_tokens.unwrap_or(Some(DEFAULT_MAX_OUTPUT_TOKENS)),
             };
             to_sif_with(&entries, &sif_opts)
@@ -604,6 +629,57 @@ fn cmd_glob(ga: GlobArgs) -> Result<(), String> {
 
     print!("{}", output);
     Ok(())
+}
+
+/// A path's exact bytes (Unix), or its UTF-8 form elsewhere.
+fn path_bytes(p: &std::path::Path) -> std::borrow::Cow<'_, [u8]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::borrow::Cow::Borrowed(p.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::borrow::Cow::Owned(p.to_string_lossy().into_owned().into_bytes())
+    }
+}
+
+/// Deleted files (absolute) that the walk's patterns and -k would have
+/// listed, spelled as the walk spells paths: relative to the cwd for
+/// relative patterns, absolute for absolute ones.
+fn deleted_matches(
+    deleted: &[std::path::PathBuf],
+    patterns: &[String],
+    ga: &GlobArgs,
+) -> Vec<std::path::PathBuf> {
+    if deleted.is_empty() {
+        return Vec::new();
+    }
+    let cwd = env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok());
+    let opts = MatchOptions {
+        require_literal_separator: true,
+        require_literal_leading_dot: !ga.hidden,
+        ..MatchOptions::new()
+    };
+    let compiled: Vec<globber::Pattern> = patterns
+        .iter()
+        .flat_map(|p| globber::expand_braces(p))
+        .filter_map(|p| globber::Pattern::new(p.strip_prefix("./").unwrap_or(&p)).ok())
+        .collect();
+    let mut out: Vec<std::path::PathBuf> = deleted
+        .iter()
+        .filter_map(|abs| {
+            let rel = cwd.as_ref().and_then(|c| abs.strip_prefix(c).ok());
+            compiled.iter().find_map(|pat| {
+                let spelled = if pat.as_str().starts_with('/') { abs.as_path() } else { rel? };
+                pat.matches_path_with(spelled, opts).then(|| spelled.to_path_buf())
+            })
+        })
+        .filter(|p| ga.kind_filter.is_empty() || ga.kind_filter.contains(&FileKind::infer(p)))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn cmd_match(ma: MatchArgs) -> Result<(), String> {
@@ -817,7 +893,9 @@ OPTIONS
 
   -G, --git-changed [REF]
       Only include files changed since REF: committed, staged, unstaged,
-      and untracked. Changes are measured from the merge base of REF and
+      and untracked. Changed files that were deleted can't be listed as
+      entries, so matching ones get a §deleted section (-p: a stderr
+      note) and a git_deleted count in -S. Changes are measured from the merge base of REF and
       HEAD, so -G main lists what this branch changed. Default REF: HEAD
       (uncommitted work). An unknown REF is an error. The next argument
       is taken as REF unless it starts with - or contains * ? [ — use

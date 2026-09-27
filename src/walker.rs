@@ -381,6 +381,10 @@ pub struct PruneCounts {
     pub nested_repos: usize,
     /// Symlinked directories listed but not entered (`follow_symlinks`).
     pub symlink_dirs: usize,
+    /// Results whose path is not valid UTF-8. They are listed (patterns
+    /// match a U+FFFD-replaced copy of the name), but text formats like
+    /// SIF can only show them lossily.
+    pub non_utf8_names: usize,
 }
 
 /// Walk the filesystem matching any of several patterns in a single pass.
@@ -691,6 +695,7 @@ struct Counters {
     exclude: AtomicUsize,
     nested_repos: AtomicUsize,
     symlink_dirs: AtomicUsize,
+    non_utf8: AtomicUsize,
 }
 
 impl Counters {
@@ -701,6 +706,7 @@ impl Counters {
             exclude: self.exclude.load(Relaxed),
             nested_repos: self.nested_repos.load(Relaxed),
             symlink_dirs: self.symlink_dirs.load(Relaxed),
+            non_utf8_names: self.non_utf8.load(Relaxed),
         }
     }
 }
@@ -821,7 +827,7 @@ impl Walker<'_> {
         for base in &outer {
             let dir = base
                 .iter()
-                .fold(scope.clone(), |d, c| join(&d, &c.to_string_lossy()));
+                .fold(scope.clone(), |d, c| join(&d, c));
             if !dir.is_dir() {
                 continue;
             }
@@ -871,12 +877,13 @@ impl Walker<'_> {
     /// Tracked files may be dotfiles: git already chose them, so wildcards
     /// match them without -a.
     fn match_rel(&self, scope: &Path, rel: &Path, tracked: bool, initial: &[State]) -> Option<PathBuf> {
-        let names: Vec<&str> = rel.iter().map(|c| c.to_str()).collect::<Option<_>>()?;
+        let comps: Vec<&std::ffi::OsStr> = rel.iter().collect();
         let mut states = initial.to_vec();
         let mut path = scope.to_path_buf();
-        for (level, name) in names.iter().enumerate() {
-            let last = level + 1 == names.len();
-            path = join(&path, name);
+        for (level, raw) in comps.iter().enumerate() {
+            let last = level + 1 == comps.len();
+            let name = &*raw.to_string_lossy();
+            path = join(&path, raw);
             let (matched, next, _) = self.step(name, !last, level, &states, tracked);
             if (last && !matched) || (!last && next.is_empty()) {
                 if !tracked {
@@ -889,6 +896,9 @@ impl Walker<'_> {
                 return None;
             }
             if last {
+                if path.to_str().is_none() {
+                    self.counts.non_utf8.fetch_add(1, Relaxed);
+                }
                 return Some(path);
             }
             states = next;
@@ -1043,17 +1053,24 @@ impl Walker<'_> {
             dir_entries
                 .into_par_iter()
                 .filter_map(|de| {
-                    let name = de.file_name();
-                    let name = name.to_str()?;
+                    let raw = de.file_name();
+                    // Names that aren't UTF-8 are matched through a lossy
+                    // copy; the path keeps the exact bytes.
+                    let name = raw.to_string_lossy();
                     let ft = de.file_type().ok()?;
-                    let path = join(dir, name);
+                    let path = join(dir, &raw);
                     let is_symlink = ft.is_symlink();
                     let is_dir = if is_symlink {
                         fs::metadata(&path).is_ok_and(|m| m.is_dir())
                     } else {
                         ft.is_dir()
                     };
-                    self.classify(name, path, is_dir, is_symlink, Some(&de), level, states, ignores)
+                    let child =
+                        self.classify(&name, path, is_dir, is_symlink, Some(&de), level, states, ignores)?;
+                    if child.is_result && matches!(name, std::borrow::Cow::Owned(_)) {
+                        self.counts.non_utf8.fetch_add(1, Relaxed);
+                    }
+                    Some(child)
                 })
                 .collect()
         };
@@ -1216,10 +1233,7 @@ impl Walker<'_> {
             require_literal_leading_dot: false,
         };
         let name_opts = MatchOptions { require_literal_separator: false, ..path_opts };
-        let path_str = match path.to_str() {
-            Some(s) => s,
-            None => return false,
-        };
+        let path_str = &*path.to_string_lossy();
         let dir_form = if is_dir { Some(format!("{}/", path_str)) } else { None };
         self.opts.exclude.iter().any(|pat| {
             if pat.as_str().contains('/') {
@@ -1234,9 +1248,9 @@ impl Walker<'_> {
 
 /// Join a child name onto a directory, keeping walks from "." free of a
 /// `./` prefix.
-fn join(dir: &Path, name: &str) -> PathBuf {
+fn join(dir: &Path, name: impl AsRef<Path>) -> PathBuf {
     if dir == Path::new(".") {
-        PathBuf::from(name)
+        name.as_ref().to_path_buf()
     } else {
         dir.join(name)
     }
